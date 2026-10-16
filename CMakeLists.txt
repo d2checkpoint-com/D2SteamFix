@@ -83,7 +83,9 @@ endif()
 
 function(steamfix_add_test target)
     cmake_parse_arguments(TEST "" "" "ARGS" ${ARGN})
-    add_executable(${target} ${TEST_UNPARSED_ARGUMENTS})
+    # Repair code imports TaskDialogIndirect, which requires Common Controls 6
+    # even when a test never opens a dialog. Match the application's manifest.
+    add_executable(${target} ${TEST_UNPARSED_ARGUMENTS} src/steamfix.manifest)
     target_include_directories(${target} PRIVATE include)
     target_compile_features(${target} PRIVATE cxx_std_20)
     target_compile_definitions(${target} PRIVATE
@@ -117,7 +119,7 @@ if(BUILD_TESTING)
         # Load every production translation unit in one Debug module. This keeps
         # wholly uncalled code in the coverage denominator; it is not a test.
         add_executable(steamfix_coverage_inventory
-            cmake/coverage_inventory.cpp src/main.cpp ${STEAMFIX_SOURCES})
+            cmake/coverage_inventory.cpp src/main.cpp ${STEAMFIX_SOURCES} src/steamfix.manifest)
         target_include_directories(steamfix_coverage_inventory PRIVATE include)
         target_compile_features(steamfix_coverage_inventory PRIVATE cxx_std_20)
         target_compile_definitions(steamfix_coverage_inventory PRIVATE

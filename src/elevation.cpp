@@ -297,22 +297,26 @@ UniqueHandle checked_file(const fs::path& path, const DWORD access, const DWORD 
     return file;
 }
 
-void rename_without_replacement(const HANDLE file, const fs::path& target) {
+std::vector<std::byte> rename_information(const fs::path& target) {
     std::wstring destination = target.native();
     if (destination.starts_with(L"\\\\?\\")) destination.erase(0, 4);
     constexpr std::size_t header_size = offsetof(FILE_RENAME_INFO, FileName);
     if (destination.size() > (MAXDWORD - header_size) / sizeof(wchar_t)) fail(ERROR_BAD_PATHNAME);
     const std::size_t name_bytes = destination.size() * sizeof(wchar_t);
-    FILE_RENAME_INFO rename{};
-    rename.ReplaceIfExists = FALSE;
-    rename.RootDirectory = nullptr;
-    rename.FileNameLength = static_cast<DWORD>(name_bytes);
-    std::vector<std::byte> storage(std::max(sizeof(rename), header_size + name_bytes));
-    // The Win32 variable-length structure is marshalled as bytes; no C++
-    // FILE_RENAME_INFO object is overlaid on vector storage.
-    std::memcpy(storage.data(), &rename, header_size);
+    const DWORD length = static_cast<DWORD>(name_bytes);
+    std::vector<std::byte> storage(std::max(sizeof(FILE_RENAME_INFO), header_size + name_bytes));
+    // Win32 uses zero for ReplaceIfExists=false and RootDirectory=nullptr.
+    // Keep their entire native header, including union and alignment bytes,
+    // zeroed instead of copying indeterminate C++ structure padding into it.
+    std::memcpy(std::span{storage}.subspan(offsetof(FILE_RENAME_INFO, FileNameLength), sizeof(length)).data(),
+                &length, sizeof(length));
     std::ranges::copy(std::as_bytes(std::span{destination}),
                       std::span{storage}.subspan(header_size, name_bytes).begin());
+    return storage;
+}
+
+void rename_without_replacement(const HANDLE file, const fs::path& target) {
+    std::vector<std::byte> storage = rename_information(target);
     if (!SetFileInformationByHandle(file, FileRenameInfo, storage.data(),
                                     static_cast<DWORD>(storage.size()))) fail(GetLastError());
 }

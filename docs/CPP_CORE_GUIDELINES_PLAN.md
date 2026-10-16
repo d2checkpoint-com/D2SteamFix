@@ -16,7 +16,8 @@ D2SteamFix temporarily changes Steam overlay permissions and restores them when 
 - [x] (2026-10-16) Complete review and fixes across every C++ source/header and build configuration.
 - [x] (2026-10-16) Integrate six real-Windows fixture test suites, analyzer checks, and complete-source coverage reporting; all production and test executables cross-compile and link with MinGW warnings as errors.
 - [ ] Run supported MSVC Debug/Release builds, Windows regression suites, and production coverage in CI.
-- [ ] Record exceptions and validation limits, commit version 1.1.1, and open a pull request.
+- [x] (2026-10-16) Record exceptions and validation limits, commit version 1.1.1, and open [pull request 18](https://github.com/d2checkpoint-com/D2SteamFix/pull/18).
+- [ ] Finish native CI and measured coverage, address testable gaps, complete final cross-review, and update the pull request with exact evidence.
 
 ## Surprises & Discoveries
 
@@ -38,10 +39,12 @@ On 2026-10-16, split writers by file ownership in the shared checkout. ACL owner
 
 On 2026-10-16, the user requested independent cross-review after implementation and test coverage as close to 100% as possible. Expand tests to actual production implementation files and real Windows fixtures. Include every production translation unit in the coverage denominator using an unoptimized inventory executable, fail incomplete reports, and expose uncovered lines. Avoid inventing a percentage before Windows execution or excluding uncalled code to inflate coverage.
 
+On 2026-10-16, native MSVC analysis reported valid owner lifetimes as invalid after optional/aggregate transfers. First simplify ownership and immutable view handling; where the experimental model still cannot follow owning filesystem paths, suppress only the reviewed statement and document its invariant. Keep every selected rule enabled. Independent cross-review covers these changes and the test-only moved-from contract checks.
+
 ## Outcomes & Retrospective
 
 
-Production review and corrective implementation are complete. Six suites now cover command-line quoting, resource/conversion helpers, application sessions, ACL/recovery, elevation/IPC, and runtime discovery/repair helpers. All binaries cross-compile and link with MinGW warnings as errors. Independent cross-review found and resolved exception-copy safety and an overly broad test deny mask. Supported Windows CI results and remaining coverage gaps will be recorded before delivery.
+Production review and corrective implementation are complete. Six suites now cover command-line quoting, resource/conversion helpers, application sessions, ACL/recovery, elevation/IPC, and runtime discovery/repair helpers. All binaries cross-compile and link with MinGW warnings as errors; all thirteen public headers compile independently and on repeated inclusion. Independent cross-review found and resolved exception-copy safety, an overly broad test deny mask, and an incorrect test error expectation. Pull request 18 is open as a draft. Native CI has compiled the project and exposed analyzer-model limitations, now addressed with direct construction and documented statement-level exceptions. Supported Windows test outcomes and measured coverage remain pending.
 
 ## Context and Orientation
 

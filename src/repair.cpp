@@ -125,6 +125,9 @@ bool same_user(const HANDLE first, const HANDLE second) {
 }
 
 bool access_allowed(const HANDLE file, const HANDLE token, const DWORD access) {
+    // -1 is also the current-process pseudo-handle. Security APIs can accept
+    // it, but this helper must only inspect an actual opened renderer file.
+    if (file == nullptr || file == INVALID_HANDLE_VALUE) throw_win32(ERROR_INVALID_HANDLE);
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     const DWORD status = GetSecurityInfo(file, SE_FILE_OBJECT,
         OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,

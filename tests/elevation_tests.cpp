@@ -301,6 +301,21 @@ void check_protocol_and_transport() {
 }
 
 void check_paths_and_file_operations() {
+    const fs::path archive_name(L"C:\\directory\\archive.old");
+    const auto rename_bytes = elevation::rename_information(archive_name);
+    require(rename_bytes.size() == offsetof(FILE_RENAME_INFO, FileName) + archive_name.native().size() * sizeof(wchar_t),
+            "The native rename request has an unexpected byte length");
+    require(std::ranges::all_of(std::span{rename_bytes}.first(offsetof(FILE_RENAME_INFO, FileNameLength)),
+                               [](const std::byte byte) { return byte == std::byte{}; }),
+            "The native rename request contains nonzero replacement/root/reserved bytes");
+    FILE_RENAME_INFO native_rename{};
+    std::memcpy(&native_rename, rename_bytes.data(), offsetof(FILE_RENAME_INFO, FileName));
+    require(native_rename.ReplaceIfExists == FALSE && native_rename.RootDirectory == nullptr &&
+            native_rename.FileNameLength == archive_name.native().size() * sizeof(wchar_t),
+            "The native rename header does not describe a non-replacing absolute rename");
+    require(std::ranges::equal(std::span{rename_bytes}.subspan(offsetof(FILE_RENAME_INFO, FileName)),
+                               std::as_bytes(std::span{archive_name.native()})),
+            "The native rename filename bytes do not match their declared length");
     TemporaryDirectory fixture;
     const fs::path& directory = fixture.path();
     elevation::validate_path(directory / L"future.dat");
@@ -405,8 +420,32 @@ void check_paths_and_file_operations() {
                 "Cannot resize the log fixture");
     }
     create_file(directory / L"steamfix.log.old", "preserve");
-    require(elevation::rotate_log(log) && !fs::exists(log) &&
-            fs::file_size(directory / L"steamfix.log.old.1") > 4U * 1024U * 1024U,
+    const bool rotated = elevation::rotate_log(log);
+    const fs::path expected_archive = directory / L"steamfix.log.old.1";
+    if (!rotated || fs::exists(log) || !fs::exists(expected_archive)) {
+        std::cerr << "Rotation diagnostics: result=" << rotated
+                  << ", native header size=" << sizeof(FILE_RENAME_INFO)
+                  << ", replacement width=" << sizeof(native_rename.ReplaceIfExists)
+                  << ", root offset=" << offsetof(FILE_RENAME_INFO, RootDirectory)
+                  << ", length offset=" << offsetof(FILE_RENAME_INFO, FileNameLength)
+                  << ", filename offset=" << offsetof(FILE_RENAME_INFO, FileName) << '\n';
+        for (const auto& entry : fs::directory_iterator(directory)) {
+            std::error_code error;
+            const auto size = entry.file_size(error);
+            std::cerr << "Fixture entry: " << steamfix::display_path(entry.path().filename())
+                      << ", bytes=" << (error ? 0 : size) << '\n';
+        }
+        const fs::path first_archive = directory / L"steamfix.log.old";
+        if (fs::is_regular_file(first_archive)) {
+            std::ifstream contents(first_archive, std::ios::binary);
+            std::array<char, 32> prefix{};
+            contents.read(prefix.data(), static_cast<std::streamsize>(prefix.size()));
+            std::cerr << "First archive prefix after rotation: "
+                      << std::string_view(prefix.data(), static_cast<std::size_t>(contents.gcount())) << '\n';
+        }
+        throw std::runtime_error("Rotation did not preserve the occupied archive and create the next archive");
+    }
+    require(fs::file_size(expected_archive) > 4U * 1024U * 1024U,
             "Oversized log rotation failed");
     std::ifstream archived(directory / L"steamfix.log.old", std::ios::binary);
     const std::string preserved{std::istreambuf_iterator<char>(archived), std::istreambuf_iterator<char>()};
@@ -688,9 +727,10 @@ int main() {
         };
         int count{};
         const std::unique_ptr<wchar_t*, ArgumentsDeleter> parsed(CommandLineToArgvW(GetCommandLineW(), &count));
-        require(parsed != nullptr && count > 0, "Cannot parse the fixture command line");
+        if (!parsed || count <= 0) throw std::runtime_error("Cannot parse the fixture command line");
+        const std::span parsed_arguments{parsed.get(), static_cast<std::size_t>(count)};
         std::vector<std::wstring> arguments;
-        for (const auto* argument : std::span{parsed.get(), static_cast<std::size_t>(count)}.subspan(1)) {
+        for (const auto* argument : parsed_arguments.subspan(1)) {
             arguments.emplace_back(argument);
         }
         if (const auto status = elevation::dispatch_helper(arguments)) return *status;

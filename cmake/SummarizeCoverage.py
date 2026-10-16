@@ -16,7 +16,7 @@ def line_ranges(lines):
     return ", ".join(str(start) if start == end else f"{start}-{end}" for start, end in ranges)
 
 
-def summarize(report, source_root):
+def summarize(report, source_root, test_run_failed=False):
     files = {}
     document = ET.parse(report)
     source_roots = [source_root]
@@ -57,6 +57,8 @@ def summarize(report, source_root):
     percentage = 100.0 * covered / total if total else 0.0
     complete = not missing and total > 0
     label = "Measured coverage" if complete else "Partial coverage (incomplete denominator)"
+    if test_run_failed:
+        label = "Coverage from a failed test run; not a passing-suite baseline"
     output = [
         "# Production line coverage",
         "",
@@ -91,8 +93,11 @@ def main():
     parser.add_argument("report", type=Path)
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--test-run-failed", action="store_true")
     arguments = parser.parse_args()
-    summary, complete = summarize(arguments.report, arguments.source_root.resolve())
+    summary, complete = summarize(
+        arguments.report, arguments.source_root.resolve(), arguments.test_run_failed
+    )
     arguments.output.write_text(summary, encoding="utf-8")
     print(summary)
     if os.environ.get("GITHUB_STEP_SUMMARY"):

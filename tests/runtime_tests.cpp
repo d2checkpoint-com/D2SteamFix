@@ -48,6 +48,17 @@ void check_status(const LSTATUS status) {
     }
 }
 
+template<std::invocable Operation>
+void expect_windows_failure(Operation operation, const DWORD expected, const char* message) {
+    try {
+        operation();
+    } catch (const std::system_error& error) {
+        require(static_cast<DWORD>(error.code().value()) == expected, message);
+        return;
+    }
+    throw std::runtime_error(message);
+}
+
 class TemporaryDirectory {
 public:
     TemporaryDirectory() {
@@ -407,8 +418,10 @@ void check_repair_files(const fs::path& root, const steamfix::Logger& log) {
     expect_failure<std::runtime_error>([&] { verify_repaired(directory, true, log); },
                                        "repair accepted an execute-denied renderer");
     expect_failure<std::runtime_error>([] { static_cast<void>(token_user(nullptr)); }, "invalid token was accepted");
-    expect_failure<std::system_error>([&] { static_cast<void>(access_allowed(INVALID_HANDLE_VALUE, token.get(), FILE_EXECUTE)); },
-                                      "invalid access-check file was accepted");
+    for (const HANDLE invalid : std::array<HANDLE, 2>{nullptr, INVALID_HANDLE_VALUE}) {
+        expect_windows_failure([&] { static_cast<void>(access_allowed(invalid, token.get(), FILE_EXECUTE)); },
+                                ERROR_INVALID_HANDLE, "invalid access-check file did not report ERROR_INVALID_HANDLE");
+    }
     expect_failure<std::system_error>([&] { require_regular(INVALID_HANDLE_VALUE, renderer64); },
                                       "invalid regular-file handle was accepted");
     const UniqueHandle folder(CreateFileW(directory.c_str(), FILE_READ_ATTRIBUTES,

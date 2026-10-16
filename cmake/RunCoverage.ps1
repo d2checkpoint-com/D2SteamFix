@@ -46,9 +46,15 @@ if (Test-Path "LastCoverageResults.log") {
 }
 
 if (Test-Path (Join-Path $outputRoot "coverage.xml")) {
-    python (Join-Path $PSScriptRoot "SummarizeCoverage.py") `
-        (Join-Path $outputRoot "coverage.xml") --source-root $sourceRoot `
-        --output (Join-Path $outputRoot "summary.md")
+    $summaryArguments = @(
+        (Join-Path $PSScriptRoot "SummarizeCoverage.py"),
+        (Join-Path $outputRoot "coverage.xml"), "--source-root", $sourceRoot,
+        "--output", (Join-Path $outputRoot "summary.md")
+    )
+    if ($coverageStatus -ne 0) {
+        $summaryArguments += "--test-run-failed"
+    }
+    python @summaryArguments
     if ($LASTEXITCODE -ne 0) {
         throw "Coverage report is incomplete; inspect coverage/summary.md."
     }
