@@ -329,12 +329,16 @@ void remove_file(const fs::path& path, const Logger& log) {
     log.info("Steam repair removed " + display_path(path));
 }
 
-void remove_renderers(const fs::path& directory, const Logger& log) {
+bool remove_renderers(const fs::path& directory, const Logger& log) {
     std::vector<std::pair<fs::path, UniqueHandle>> opened;
+    bool renderer32_was_present = false;
     for (const wchar_t* name : renderer_names) {
         const fs::path path = directory / name;
         auto handle = open_existing(path, DELETE);
-        if (handle) opened.emplace_back(path, std::move(*handle));
+        if (handle) {
+            if (paths::name_is(path, L"GameOverlayRenderer.dll")) renderer32_was_present = true;
+            opened.emplace_back(path, std::move(*handle));
+        }
     }
     // Acquire and validate both delete handles before removing either renderer.
     for (auto& [path, handle] : opened) {
@@ -346,6 +350,7 @@ void remove_renderers(const fs::path& directory, const Logger& log) {
         handle.reset();
         log.info("Steam repair removed " + display_path(path));
     }
+    return renderer32_was_present;
 }
 
 UniqueHandle launch_repair(const fs::path& directory, const Logger& log) {
@@ -438,11 +443,16 @@ UniqueHandle verification_token(const Logger& log) {
     return caller;
 }
 
-void verify_repaired(const fs::path& directory, const Logger& log) {
+void verify_repaired(const fs::path& directory, const bool renderer32_was_present,
+                     const Logger& log) {
     const UniqueHandle token = verification_token(log);
     for (const wchar_t* name : renderer_names) {
         const fs::path path = directory / name;
         const auto file = open_existing(path, READ_CONTROL);
+        if (!file && paths::name_is(path, L"GameOverlayRenderer.dll") && !renderer32_was_present) {
+            log.info("optional GameOverlayRenderer.dll was absent before repair and remains absent");
+            continue;
+        }
         if (!file) throw std::runtime_error("Steam repair did not recreate " + display_path(path));
         if (!access_allowed(file->get(), token.get(), FILE_GENERIC_READ | FILE_GENERIC_EXECUTE)) {
             throw std::runtime_error("Steam recreated a renderer without usable read/execute permissions: " + display_path(path));
@@ -483,10 +493,10 @@ bool run(const fs::path& game_directory, const fs::path& recovery_path, const Lo
         const MutexLock session_lock(L"Global\\D2SteamFix-1085660", 45000);
         // Do not touch renderer files if a new Steam or Destiny process appeared.
         shutdown(*directory, log);
-        remove_renderers(*directory, log);
+        const bool renderer32_was_present = remove_renderers(*directory, log);
         const UniqueHandle child = launch_repair(*directory, log);
         wait_for_repair(child.get(), *directory, log);
-        verify_repaired(*directory, log);
+        verify_repaired(*directory, renderer32_was_present, log);
         remove_file(recovery_path, log);
         fs::path temporary = recovery_path;
         temporary += L".tmp";
