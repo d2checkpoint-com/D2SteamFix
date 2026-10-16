@@ -6,7 +6,7 @@ Please note that blocking the Steam Overlay DLLs can also affect overlay-depende
 
 ## Installation
 
-Download [steamfix.exe](https://pkg.d2checkpoint.com/D2SteamFix/steamfix.exe) and place it directly in your game's directory.
+Download `steamfix.exe` from the [latest GitHub release](https://github.com/d2checkpoint-com/D2SteamFix/releases/latest) and place it directly in your game's directory.
 
 Then, open Destiny 2's launch options in Steam:
 
@@ -40,6 +40,19 @@ make.cmd configure
 ```batch
 make.cmd build
 ```
+
+GitHub Actions builds both Debug and Release configurations on Windows x64 for pushes and pull requests. The executables are available as workflow artifacts.
+
+## Publishing a Release
+
+Update the version in `CMakeLists.txt` through a pull request, then tag the commit to release with the matching version and push the tag:
+
+```bash
+git tag -a v1.0.0 -m "D2SteamFix 1.0"
+git push origin v1.0.0
+```
+
+Use the new version for each subsequent release. Pushing a `vX.Y.Z` tag runs the same build checks, verifies that the tag matches the CMake project version, and publishes a GitHub release with `steamfix.exe` attached after both builds succeed. The tagged commit must contain the release workflow.
 
 ## Windows Defender
 
