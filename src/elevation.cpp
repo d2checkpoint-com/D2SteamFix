@@ -209,22 +209,29 @@ UniqueHandle privileged_file(const Request& request, const fs::path& path, PSID 
         fail(ERROR_ACCESS_DENIED);
     }
     const bool journal = recovery(path);
-    if (!journal && !renderer(path)) fail(ERROR_ACCESS_DENIED);
+    const bool log = paths::name_is(path, L"steamfix.log") &&
+                     regular(path.parent_path() / L"destiny2.exe") &&
+                     regular(path.parent_path() / L"destiny2launcher.exe");
+    if (!journal && !log && !renderer(path)) fail(ERROR_ACCESS_DENIED);
+    if (log && (request.creation != OPEN_ALWAYS ||
+                (request.access & ~(FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE)) != 0)) {
+        fail(ERROR_ACCESS_DENIED);
+    }
     if (paths::name_is(path, L"steamfix.dat.old") &&
         (request.creation != OPEN_EXISTING || (request.access & ~(DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES)) != 0)) {
         fail(ERROR_ACCESS_DENIED);
     }
     if (request.creation != OPEN_EXISTING && !(journal && paths::name_is(path, L"steamfix.dat.tmp") &&
-                                               request.creation == CREATE_NEW)) {
+                                               request.creation == CREATE_NEW) && !(log && request.creation == OPEN_ALWAYS)) {
         fail(ERROR_ACCESS_DENIED);
     }
-    if (!journal && (request.access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
+    if (!journal && !log && (request.access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
                                        FILE_WRITE_ATTRIBUTES)) != 0) fail(ERROR_ACCESS_DENIED);
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     SECURITY_ATTRIBUTES security{sizeof(security), nullptr, FALSE};
     // A credential prompt may use a different administrator account. The backup
     // remains owned/readable by its originating user, who encrypts it with DPAPI.
-    if (request.creation == CREATE_NEW) {
+    if (request.creation == CREATE_NEW || (log && request.creation == OPEN_ALWAYS)) {
         enable_privilege(SE_RESTORE_NAME);
         const std::wstring sid = sid_string(originator);
         const std::wstring sddl = L"O:" + sid + L"D:P(A;;FA;;;" + sid + L")(A;;FA;;;SY)";
@@ -234,7 +241,7 @@ UniqueHandle privileged_file(const Request& request, const fs::path& path, PSID 
     }
     LocalMemory allocated(descriptor);
     DWORD extra_flags = 0;
-    if (journal) {
+    if (journal || log) {
         // A different administrator may approve UAC. Backup semantics let the
         // helper open the originating user's private journal without adding an ACE.
         enable_privilege(SE_BACKUP_NAME);
@@ -454,11 +461,23 @@ int helper(const DWORD parent_pid, const std::wstring& pipe_name) {
                     !paths::name_is(second, L"steamfix.dat") ||
                     !paths::equal_windows(path.parent_path(), second.parent_path())) fail(ERROR_ACCESS_DENIED);
                 Request check{};
-                check.access = READ_CONTROL;
-                check.share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+                check.access = DELETE | READ_CONTROL;
+                check.share = FILE_SHARE_READ | FILE_SHARE_WRITE;
                 check.creation = OPEN_EXISTING;
                 opened = privileged_file(check, path, user_sid(user));
-                if (!MoveFileExW(path.c_str(), second.c_str(), MOVEFILE_WRITE_THROUGH)) fail(GetLastError());
+                // Rename the validated source handle. Reopening by pathname
+                // would lose the private-journal access granted by backup semantics.
+                std::wstring destination = second.native();
+                if (destination.starts_with(L"\\\\?\\")) destination.erase(0, 4);
+                const size_t name_bytes = destination.size() * sizeof(wchar_t);
+                std::vector<std::byte> storage(offsetof(FILE_RENAME_INFO, FileName) + name_bytes);
+                auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
+                rename->ReplaceIfExists = FALSE;
+                rename->RootDirectory = nullptr;
+                rename->FileNameLength = static_cast<DWORD>(name_bytes);
+                std::memcpy(rename->FileName, destination.data(), name_bytes);
+                if (!SetFileInformationByHandle(opened.get(), FileRenameInfo, rename,
+                                                static_cast<DWORD>(storage.size()))) fail(GetLastError());
                 opened.reset();
             } else {
                 fail(ERROR_INVALID_DATA);

@@ -1,7 +1,8 @@
 #pragma once
 
+#include "steamfix/win32.hpp"
+
 #include <filesystem>
-#include <fstream>
 #include <mutex>
 #include <string_view>
 
@@ -17,7 +18,7 @@ public:
 private:
     void write(std::string_view severity, std::string_view message) const noexcept;
     mutable std::mutex mutex_;
-    mutable std::ofstream file_;
+    UniqueHandle file_;
 };
 
 } // namespace steamfix

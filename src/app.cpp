@@ -400,6 +400,8 @@ int entry() {
     std::unique_ptr<Logger> log;
     try {
         log = std::make_unique<Logger>(cwd / L"steamfix.log");
+    } catch (const elevation::Cancelled&) {
+        return 0;
     } catch (const std::exception& error) {
         ui::error(L"D2SteamFix could not open steamfix.log in the current working directory. "
                   L"Ensure the working directory is writable.\n\n" + widen(error.what()) +
