@@ -18,6 +18,7 @@ add_executable(steamfix WIN32
     src/main.cpp
     src/acl.cpp
     src/app.cpp
+    src/elevation.cpp
     src/command_line.cpp
     src/logging.cpp
     src/overlay.cpp

@@ -1,6 +1,7 @@
 #include "steamfix/acl.hpp"
 
 #include "steamfix/error.hpp"
+#include "steamfix/elevation.hpp"
 #include "steamfix/logging.hpp"
 #include "steamfix/paths.hpp"
 #include "steamfix/win32.hpp"
@@ -243,11 +244,8 @@ struct OpenedTarget {
 
 OpenedTarget open_target(const fs::path& path, const DWORD desired_access) {
     validate_target_name(path);
-    HANDLE raw = CreateFileW(path.c_str(), desired_access,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                             FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    if (raw == INVALID_HANDLE_VALUE) throw_win32(GetLastError());
-    UniqueHandle handle(raw);
+    UniqueHandle handle = elevation::open_file(path, desired_access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT);
     BY_HANDLE_FILE_INFORMATION information{};
     if (!GetFileInformationByHandle(handle.get(), &information)) throw_win32(GetLastError());
     if ((information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
@@ -334,6 +332,7 @@ public:
                                    FILE_ALL_ACCESS, system_sid_.data()) ||
             !InitializeSecurityDescriptor(&descriptor_, SECURITY_DESCRIPTOR_REVISION) ||
             !SetSecurityDescriptorDacl(&descriptor_, TRUE, acl_, FALSE) ||
+            !SetSecurityDescriptorOwner(&descriptor_, user_sid, FALSE) ||
             !SetSecurityDescriptorControl(&descriptor_, SE_DACL_PROTECTED,
                                           SE_DACL_PROTECTED)) {
             throw_win32(GetLastError());
@@ -793,28 +792,22 @@ void write_state(const fs::path& path, const std::span<const Backup> backups,
     fs::path temporary = path;
     temporary += L".tmp";
     RestrictedSecurity security(user_sid, 0);
-    HANDLE raw = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, security.attributes(),
-                             CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (raw == INVALID_HANDLE_VALUE) throw_win32(GetLastError());
+    UniqueHandle file = elevation::open_file(temporary, GENERIC_WRITE, 0, CREATE_NEW,
+                                               FILE_ATTRIBUTE_NORMAL, security.attributes());
     try {
-        UniqueHandle file(raw);
         write_all(file.get(), data);
         if (!FlushFileBuffers(file.get())) throw_win32(GetLastError());
         file.reset();
-        if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH)) {
-            throw_win32(GetLastError());
-        }
+        elevation::move_recovery_file(temporary, path);
     } catch (...) {
-        DeleteFileW(temporary.c_str());
+        try { elevation::remove_recovery_file(temporary); } catch (...) {}
         throw;
     }
 }
 
 std::vector<RecoveryEntry> read_state(const fs::path& path) {
-    HANDLE raw = CreateFileW(path.c_str(), GENERIC_READ | READ_CONTROL | WRITE_DAC, 0, nullptr,
-                             OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    if (raw == INVALID_HANDLE_VALUE) throw_win32(GetLastError());
-    UniqueHandle file(raw);
+    UniqueHandle file = elevation::open_file(path, GENERIC_READ | READ_CONTROL | WRITE_DAC,
+                                               0, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT);
     BY_HANDLE_FILE_INFORMATION information{};
     if (!GetFileInformationByHandle(file.get(), &information)) throw_win32(GetLastError());
     if ((information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
@@ -849,6 +842,7 @@ std::vector<RecoveryEntry> read_state(const fs::path& path) {
 }
 
 AppError protection_error(const char* stage, const std::exception& error) {
+    if (dynamic_cast<const elevation::Cancelled*>(&error) != nullptr) throw elevation::Cancelled();
     return AppError(ExitCode::overlay_protection, stage, error.what());
 }
 
@@ -907,9 +901,12 @@ bool recover_pending(const fs::path& path, const Logger& log) {
                                fs::filesystem_error("inspect temporary recovery file", temporary, error));
     }
     if (temporary_exists) {
-        if (!fs::remove(temporary, error) || error) {
-            throw AppError(ExitCode::overlay_protection, "ACL recovery cleanup",
-                           error ? error.message() : "could not remove temporary recovery file");
+        try {
+            if (!elevation::remove_recovery_file(temporary)) {
+                throw std::runtime_error("could not remove temporary recovery file");
+            }
+        } catch (const std::exception& exception) {
+            throw protection_error("ACL recovery cleanup", exception);
         }
         log.warn("removed an incomplete ACL recovery temporary file");
     }
@@ -945,8 +942,7 @@ bool recover_pending(const fs::path& path, const Logger& log) {
         for (const PreparedRecovery& target : prepared) {
             if (restore_one(target.entry->backup, target.writable.handle.get())) ++restored;
         }
-        const bool removed = fs::remove(path, error);
-        if (error) throw fs::filesystem_error("remove recovery file", path, error);
+        const bool removed = elevation::remove_recovery_file(path);
         if (!removed) throw std::runtime_error("recovery file disappeared before cleanup");
         log.info("processed renderer permission recovery state: restored=" +
                  std::to_string(restored) + ", skipped=" + std::to_string(skipped));
@@ -1014,8 +1010,7 @@ Protection Protection::apply(const std::vector<fs::path>& targets, fs::path stat
             } catch (const std::exception&) {
             }
             if (restored) {
-                std::error_code cleanup_error;
-                fs::remove(state_path, cleanup_error);
+                try { elevation::remove_recovery_file(state_path); } catch (...) {}
             }
             throw AppError(ExitCode::overlay_protection, "renderer permission denial",
                            display_path(backups[index].path) + ": " + error.what());
@@ -1031,10 +1026,10 @@ void Protection::restore(const Logger& log) {
     } catch (const std::exception& error) {
         throw protection_error("ACL restoration", error);
     }
-    std::error_code error;
-    fs::remove(state_path_, error);
-    if (error) {
-        throw AppError(ExitCode::overlay_protection, "ACL recovery cleanup", error.message());
+    try {
+        elevation::remove_recovery_file(state_path_);
+    } catch (const std::exception& error) {
+        throw protection_error("ACL recovery cleanup", error);
     }
     state_ = State::restored;
     log.info("restored original renderer permissions and removed recovery state");
@@ -1044,9 +1039,8 @@ Protection::~Protection() {
     if (state_ != State::active) return;
     try {
         restore_all(backups_, handles_);
-        std::error_code error;
-        fs::remove(state_path_, error);
-        if (!error) state_ = State::restored;
+        elevation::remove_recovery_file(state_path_);
+        state_ = State::restored;
     } catch (const std::exception&) {
     }
 }

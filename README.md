@@ -23,6 +23,8 @@ Replace `C:\path\to\Destiny 2` with the actual location of your Destiny 2 instal
 "C:\Program Files (x86)\Steam\steamapps\common\Destiny 2\steamfix.exe" %command%
 ```
 
+D2SteamFix supports normal and administrator launches. If Windows blocks a required permission change or launcher operation, it requests permission through the Windows administrator prompt. Cancelling the prompt stops the launch and restores any permissions already changed.
+
 ![Steam Launch Options](https://static.d2checkpoint.com/steamfix_launch_options.png)
 
 ## Building from Source

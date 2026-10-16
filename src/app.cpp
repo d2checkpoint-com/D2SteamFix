@@ -3,6 +3,7 @@
 #include "steamfix/acl.hpp"
 #include "steamfix/command_line.hpp"
 #include "steamfix/error.hpp"
+#include "steamfix/elevation.hpp"
 #include "steamfix/logging.hpp"
 #include "steamfix/overlay.hpp"
 #include "steamfix/paths.hpp"
@@ -117,20 +118,6 @@ UniqueHandle session_mutex() {
     return handle;
 }
 
-bool process_is_elevated() {
-    HANDLE raw = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) {
-        throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
-    }
-    const UniqueHandle token(raw);
-    TOKEN_ELEVATION elevation{};
-    DWORD returned = 0;
-    if (!GetTokenInformation(token.get(), TokenElevation, &elevation, sizeof(elevation), &returned)) {
-        throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
-    }
-    if (returned != sizeof(elevation)) throw std::runtime_error("invalid token-elevation result size");
-    return elevation.TokenIsElevated != 0;
-}
 
 void require_regular_file(const fs::path& path, const ExitCode code, const char* stage,
                           const char* missing_detail) {
@@ -163,7 +150,7 @@ struct ChildProcess {
     DWORD pid;
 };
 
-ChildProcess launch(const Invocation& invocation) {
+ChildProcess launch(const Invocation& invocation, const Logger& log) {
     std::wstring command_line;
     command_line::append_quoted(command_line, invocation.launcher.native());
     for (const std::wstring& argument : invocation.args) {
@@ -172,9 +159,40 @@ ChildProcess launch(const Invocation& invocation) {
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     PROCESS_INFORMATION information{};
-    if (!CreateProcessW(invocation.launcher.c_str(), command_line.data(), nullptr, nullptr, FALSE, 0,
-                        nullptr, invocation.game_dir.c_str(), &startup, &information)) {
-        throw AppError(ExitCode::process_creation, "launcher creation", windows_error());
+    bool created = elevation::launch_as_desktop_user(invocation.launcher, command_line,
+                                                    invocation.game_dir, information);
+    if (!created) {
+        if (elevation::is_elevated()) {
+            log.warn("desktop-user launch unavailable; launching from the existing administrator context");
+        }
+        created = CreateProcessW(invocation.launcher.c_str(), command_line.data(), nullptr, nullptr,
+                                  FALSE, 0, nullptr, invocation.game_dir.c_str(), &startup, &information) != FALSE;
+    }
+    if (!created) {
+        const DWORD error = GetLastError();
+        if (error != ERROR_ELEVATION_REQUIRED && !elevation::permission_denied(error)) {
+            throw AppError(ExitCode::process_creation, "launcher creation", windows_error(error));
+        }
+        std::wstring parameters;
+        for (const std::wstring& argument : invocation.args) command_line::append_quoted(parameters, argument);
+        SHELLEXECUTEINFOW execute{};
+        execute.cbSize = sizeof(execute);
+        execute.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
+        execute.lpVerb = L"runas";
+        execute.lpFile = invocation.launcher.c_str();
+        execute.lpParameters = parameters.c_str();
+        execute.lpDirectory = invocation.game_dir.c_str();
+        execute.nShow = SW_SHOWNORMAL;
+        log.info("Windows denied launcher creation; requesting permission to start the validated launcher");
+        if (!ShellExecuteExW(&execute)) {
+            const DWORD elevated_error = GetLastError();
+            if (elevated_error == ERROR_CANCELLED) throw elevation::Cancelled();
+            throw AppError(ExitCode::process_creation, "launcher permission request", windows_error(elevated_error));
+        }
+        UniqueHandle process(execute.hProcess);
+        const DWORD pid = GetProcessId(process.get());
+        if (pid == 0) throw AppError(ExitCode::process_creation, "launcher permission request", windows_error());
+        return {std::move(process), pid};
     }
     UniqueHandle process(information.hProcess);
     const UniqueHandle thread(information.hThread);
@@ -245,7 +263,7 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
     std::optional<int> exit_status;
     try {
         check_overlay();
-        ChildProcess child = launch(invocation);
+        ChildProcess child = launch(invocation, log);
         launcher_started = true;
         log.info("launched destiny2launcher.exe; beginning fail-closed process monitoring");
         exit_status = process::monitor(child.process.get(), child.pid, invocation.game_dir, log);
@@ -273,6 +291,8 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
     if (session_error) {
         try {
             std::rethrow_exception(session_error);
+        } catch (const elevation::Cancelled&) {
+            throw;
         } catch (AppError& error) {
             if (launcher_started) error.after_launch();
             throw;
@@ -353,6 +373,14 @@ Invocation validate_invocation(const std::vector<std::wstring>& args,
 } // namespace
 
 int entry() {
+    std::vector<std::wstring> forwarded;
+    try {
+        forwarded = command_line_arguments();
+        if (const std::optional<int> helper = elevation::dispatch_helper(forwarded)) return *helper;
+    } catch (const std::exception& error) {
+        ui::error(L"D2SteamFix could not read its command line: " + widen(error.what()));
+        return static_cast<int>(ExitCode::invalid_invocation);
+    }
     fs::path executable;
     try {
         executable = current_executable();
@@ -381,12 +409,7 @@ int entry() {
     log->info("startup; wrapper path: " + display_path(executable) +
               "; current working directory: " + display_path(cwd));
     try {
-        const std::vector<std::wstring> forwarded = command_line_arguments();
         const UniqueHandle mutex = session_mutex();
-        if (process_is_elevated()) {
-            throw AppError(ExitCode::validation, "privilege check",
-                           "D2SteamFix must not run as administrator; launch Steam and D2SteamFix normally");
-        }
         const fs::path recovery = acl::recovery_path(cwd);
         log->info("ACL recovery state path: " + display_path(recovery));
         std::error_code recovery_error;
@@ -416,6 +439,9 @@ int entry() {
         const int code = run(*log, forwarded, recovery);
         log->info("final exit status: " + std::to_string(code));
         return code;
+    } catch (const elevation::Cancelled&) {
+        log->info("Windows permission request cancelled; no launcher was started");
+        return 0;
     } catch (const AppError& error) {
         log->error(std::string(error.what()) + "; helper exit code=" +
                    std::to_string(static_cast<int>(error.code())));
