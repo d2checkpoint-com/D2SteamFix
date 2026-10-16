@@ -102,7 +102,7 @@ if(BUILD_TESTING)
     steamfix_add_test(win32_tests tests/win32_tests.cpp)
 
     set(STEAMFIX_APP_TEST_SOURCES ${STEAMFIX_SOURCES})
-    list(REMOVE_ITEM STEAMFIX_APP_TEST_SOURCES src/app.cpp src/ui.cpp)
+    list(REMOVE_ITEM STEAMFIX_APP_TEST_SOURCES src/acl.cpp src/app.cpp src/ui.cpp)
     steamfix_add_test(app_tests tests/app_tests.cpp ${STEAMFIX_APP_TEST_SOURCES} ARGS --entry-check)
     steamfix_add_test(acl_tests tests/acl_tests.cpp
         src/elevation.cpp src/logging.cpp src/paths.cpp src/command_line.cpp)
@@ -111,6 +111,8 @@ if(BUILD_TESTING)
         src/command_line.cpp src/elevation.cpp src/logging.cpp src/ui.cpp)
     steamfix_add_test(process_fault_tests tests/process_fault_tests.cpp
         src/elevation.cpp src/logging.cpp src/paths.cpp src/command_line.cpp)
+    steamfix_add_test(repair_workflow_tests tests/repair_workflow_tests.cpp
+        src/command_line.cpp src/elevation.cpp src/logging.cpp src/paths.cpp src/process.cpp src/steam.cpp)
     steamfix_add_test(ui_entry_tests tests/ui_entry_tests.cpp src/ui.cpp src/command_line.cpp
         ARGS $<TARGET_FILE:steamfix>)
     add_dependencies(ui_entry_tests steamfix)

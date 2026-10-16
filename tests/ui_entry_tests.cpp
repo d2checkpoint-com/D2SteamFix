@@ -188,9 +188,23 @@ void inspect_and_close(const HWND dialog, const ChildProcess& child,
     } while (!found && std::chrono::steady_clock::now() < deadline);
     require(found, "D2SteamFix dialog did not contain its expected message");
     require(is_owned_dialog(dialog, child.pid()), "dialog ownership changed before closing");
-    if (!PostMessageW(dialog, WM_COMMAND, static_cast<WPARAM>(IDOK), 0)) throw_windows_error();
+    const HWND button = GetDlgItem(dialog, IDOK);
+    require(button != nullptr && GetParent(button) == dialog, "owned dialog has no OK button");
+    DWORD button_pid = 0;
+    GetWindowThreadProcessId(button, &button_pid);
+    std::array<wchar_t, 64> button_class{};
+    require(button_pid == child.pid() &&
+            GetClassNameW(button, button_class.data(), static_cast<int>(button_class.size())) != 0 &&
+            std::wstring_view(button_class.data()) == L"Button", "OK button does not belong to the test-owned dialog");
+    require(is_owned_dialog(dialog, child.pid()), "dialog ownership changed before its OK button click");
+    DWORD_PTR click_result = 0;
+    // The native button sends the full WM_COMMAND notification, including its
+    // control handle, which MessageBox uses to finish its modal dialog loop.
+    const LRESULT clicked = SendMessageTimeoutW(button, BM_CLICK, 0, 0,
+        SMTO_ABORTIFHUNG | SMTO_BLOCK, 1000, &click_result);
     const DWORD wait = WaitForSingleObject(child.get(), 5000);
     if (wait == WAIT_FAILED) throw_windows_error();
+    require(clicked != 0 || wait == WAIT_OBJECT_0, "owned dialog OK button did not accept its click");
     require(wait == WAIT_OBJECT_0, "dialog child did not exit after its OK command");
     require(child.exit_status() == expected_exit, "dialog child returned an unexpected exit status");
 }

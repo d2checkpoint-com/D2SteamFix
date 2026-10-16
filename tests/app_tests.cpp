@@ -1,6 +1,122 @@
 // Include the implementation to exercise private validation without exposing a
 // test-only application API. Link the remaining production modules normally.
+#include "steamfix/elevation.hpp"
+
+#include <aclapi.h>
+#include <dpapi.h>
+#include <shellapi.h>
+
+#include <filesystem>
+#include <stdexcept>
+#include <string>
+
+namespace app_fault {
+
+enum class Kind { process_error, cancelled, relaunch, standard_error, unexpected_error, real_launch };
+
+struct Plan {
+    Kind kind = Kind::process_error;
+    DWORD error = ERROR_BAD_EXE_FORMAT;
+    bool elevated = false;
+    std::filesystem::path steam;
+    int cleanup_failures = 0;
+};
+
+struct UnexpectedFailure final {};
+
+// Faults affect only the coordinator's call sites in this test translation
+// unit. Other production modules continue to use their real implementations.
+thread_local const Plan* active = nullptr;
+thread_local bool restoring = false;
+thread_local int cleanup_failures = 0;
+
+class Scope final {
+public:
+    explicit Scope(const Plan& plan) noexcept
+        : previous_(active), previous_restoring_(restoring), previous_failures_(cleanup_failures) {
+        active = &plan;
+        restoring = false;
+        cleanup_failures = plan.cleanup_failures;
+    }
+    ~Scope() noexcept {
+        active = previous_;
+        restoring = previous_restoring_;
+        cleanup_failures = previous_failures_;
+    }
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+    Scope(Scope&&) = delete;
+    Scope& operator=(Scope&&) = delete;
+private:
+    const Plan* previous_;
+    bool previous_restoring_;
+    int previous_failures_;
+};
+
+DWORD WINAPI set_security(const HANDLE handle, const SE_OBJECT_TYPE type, const SECURITY_INFORMATION information,
+                          PSID owner, PSID group, PACL dacl, PACL sacl) {
+    if (active != nullptr && restoring && cleanup_failures > 0) {
+        --cleanup_failures;
+        return ERROR_ACCESS_DENIED;
+    }
+    return ::SetSecurityInfo(handle, type, information, owner, group, dacl, sacl);
+}
+
+BOOL WINAPI create_process(LPCWSTR application, LPWSTR command, LPSECURITY_ATTRIBUTES process_security,
+                           LPSECURITY_ATTRIBUTES thread_security, BOOL inherit, DWORD flags,
+                           LPVOID environment, LPCWSTR directory, LPSTARTUPINFOW startup,
+                           LPPROCESS_INFORMATION information) {
+    if (active != nullptr && active->kind != Kind::real_launch) {
+        SetLastError(active->error);
+        return FALSE;
+    }
+    return ::CreateProcessW(application, command, process_security, thread_security, inherit,
+                            flags, environment, directory, startup, information);
+}
+
+} // namespace app_fault
+
+namespace steamfix::elevation {
+
+bool app_test_is_elevated() {
+    return app_fault::active != nullptr ? app_fault::active->elevated : is_elevated();
+}
+
+bool app_test_desktop_launch(const std::filesystem::path& executable, const std::wstring& command,
+                             const std::filesystem::path& directory, PROCESS_INFORMATION& information) {
+    if (app_fault::active == nullptr) return launch_as_desktop_user(executable, command, directory, information);
+    app_fault::restoring = true;
+    switch (app_fault::active->kind) {
+    case app_fault::Kind::process_error:
+    case app_fault::Kind::real_launch:
+        return false;
+    case app_fault::Kind::cancelled:
+        throw Cancelled();
+    case app_fault::Kind::relaunch:
+        throw RelaunchRequired(app_fault::active->error, directory, executable, app_fault::active->steam);
+    case app_fault::Kind::standard_error:
+        throw std::runtime_error("injected coordinator launch failure");
+    case app_fault::Kind::unexpected_error:
+        throw app_fault::UnexpectedFailure{};
+    }
+    throw std::logic_error("unknown launch-fault kind");
+}
+
+} // namespace steamfix::elevation
+
+// Only ACL operations from this included implementation see the finite cleanup
+// fault. Targets are always the fixture renderers supplied by check_session.
+#define SetSecurityInfo app_fault::set_security
+#include "../src/acl.cpp"
+#undef SetSecurityInfo
+
+#define CreateProcessW app_fault::create_process
+#define is_elevated app_test_is_elevated
+#define launch_as_desktop_user app_test_desktop_launch
 #include "../src/app.cpp"
+#undef CreateProcessW
+#undef is_elevated
+#undef launch_as_desktop_user
 
 #include <objbase.h>
 
@@ -297,6 +413,64 @@ void check_session(const fs::path& directory) {
     }
     require(!fs::exists(recovery) && read_file(renderer) == "immutable renderer contents" &&
             read_file(renderer32) == "immutable 32-bit contents", "session restores and cleans journal");
+    const auto check_restored = [&] {
+        require(!fs::exists(recovery) && !repair::needed(steam, log) &&
+                read_file(renderer) == "immutable renderer contents", "launch faults preserve original permissions");
+    };
+    for (const auto kind : {app_fault::Kind::cancelled, app_fault::Kind::relaunch,
+                            app_fault::Kind::standard_error, app_fault::Kind::unexpected_error}) {
+        const app_fault::Plan plan{kind, ERROR_ACCESS_DENIED, false, steam};
+        const app_fault::Scope faults(plan);
+        bool caught = false;
+        try {
+            app::run(log, arguments, recovery, steam);
+        } catch (const elevation::Cancelled&) {
+            caught = kind == app_fault::Kind::cancelled;
+        } catch (const elevation::RelaunchRequired& request) {
+            caught = kind == app_fault::Kind::relaunch && paths::equal_windows(request.launcher(), launcher) &&
+                     paths::equal_windows(request.steam_directory(), steam);
+        } catch (const AppError& error) {
+            caught = (kind == app_fault::Kind::standard_error || kind == app_fault::Kind::unexpected_error) &&
+                     error.code() == ExitCode::internal && !error.launcher_started();
+        }
+        require(caught, "coordinator preserves injected failure identity after restoration");
+        check_restored();
+    }
+    for (const DWORD error : {ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD, ERROR_ELEVATION_REQUIRED}) {
+        for (const bool elevated : {false, true}) {
+            const app_fault::Plan plan{app_fault::Kind::process_error, error, elevated, steam};
+            const app_fault::Scope faults(plan);
+            bool caught = false;
+            try {
+                app::run(log, arguments, recovery, steam);
+            } catch (const elevation::RelaunchRequired& request) {
+                caught = !elevated && paths::equal_windows(request.directory(), game);
+            } catch (const AppError& failure) {
+                caught = elevated && failure.code() == ExitCode::process_creation && !failure.launcher_started();
+            }
+            require(caught, "permission failure selects administrator retry only when appropriate");
+            check_restored();
+        }
+    }
+    for (const auto kind : {app_fault::Kind::standard_error, app_fault::Kind::unexpected_error,
+                            app_fault::Kind::real_launch}) {
+        const app_fault::Plan plan{kind, ERROR_ACCESS_DENIED, false, steam, 1};
+        const app_fault::Scope faults(plan);
+        bool caught = false;
+        try {
+            app::run(log, arguments, recovery, steam);
+        } catch (const AppError& error) {
+            caught = error.code() == ExitCode::overlay_protection &&
+                     error.launcher_started() == (kind == app_fault::Kind::real_launch);
+            const bool preceding = error.detail().find("preceding session failure") != std::string::npos;
+            require(preceding == (kind != app_fault::Kind::real_launch),
+                    "cleanup reporting retains preceding failures without inventing one");
+        }
+        require(caught && app_fault::cleanup_failures == 0, "cleanup failure keeps correct session context");
+        // Explicit cleanup reports the failure; the resource destructor retries
+        // the consumed transient fault and restores the original permissions.
+        check_restored();
+    }
     // A valid path with invalid executable bytes forces CreateProcess failure
     // after the recovery journal and execute denial have been established.
     write_file(launcher, "invalid executable");
