@@ -191,7 +191,9 @@ ChildProcess launch(const Invocation& invocation, const Logger& log) {
         }
         UniqueHandle process(execute.hProcess);
         const DWORD pid = GetProcessId(process.get());
-        if (pid == 0) throw AppError(ExitCode::process_creation, "launcher permission request", windows_error());
+        if (pid == 0) {
+            log.warn("elevated launcher started without a queryable PID; retaining its waitable process handle");
+        }
         return {std::move(process), pid};
     }
     UniqueHandle process(information.hProcess);

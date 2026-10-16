@@ -224,9 +224,12 @@ std::optional<int> monitor(const HANDLE child, const DWORD child_pid, const fs::
                         child_finished = true;
                         child_status = static_cast<int>(status);
                     } else {
-                        const DWORD error = GetLastError();
-                        record_child_wait_failure("GetExitCodeProcess failed: " +
-                                                  windows_error(error));
+                        // The signaled process handle proves the launcher exited.
+                        // UAC may provide a waitable handle without exit-code rights.
+                        child_finished = true;
+                        child_wait_failures = 0;
+                        log.warn("original launcher exited; exit status is unavailable: " +
+                                 windows_error(GetLastError()));
                     }
                 } else {
                     const std::string detail =
