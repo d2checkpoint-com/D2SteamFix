@@ -14,7 +14,7 @@ D2SteamFix temporarily changes Steam overlay permissions and restores them when 
 - [x] (2026-10-16) Read the C++ Core Guidelines skill and inventoried all tracked project files.
 - [x] (2026-10-16) Assigned independent owners for ACL recovery, elevation, runtime operations, and build checks; coordinator owns application and shared support code.
 - [x] (2026-10-16) Complete review and fixes across every C++ source/header and build configuration.
-- [x] (2026-10-16) Integrate six real-Windows fixture test suites, analyzer checks, and complete-source coverage reporting; all production and test executables cross-compile and link with MinGW warnings as errors.
+- [x] (2026-10-16) Integrate nine real-Windows fixture test suites, analyzer checks, and complete-source coverage reporting; all production and test executables cross-compile and link with MinGW warnings as errors.
 - [ ] Run supported MSVC Debug/Release builds, Windows regression suites, and production coverage in CI.
 - [x] (2026-10-16) Record exceptions and validation limits, commit version 1.1.1, and open [pull request 18](https://github.com/d2checkpoint-com/D2SteamFix/pull/18).
 - [ ] Finish native CI and measured coverage, address testable gaps, complete final cross-review, and update the pull request with exact evidence.
@@ -24,9 +24,11 @@ D2SteamFix temporarily changes Steam overlay permissions and restores them when 
 
 The skill main file is available, but its referenced rule index and guideline shards fail to load through the skill provider. The official isocpp CppCoreGuidelines document was downloaded to /tmp/CppCoreGuidelines.md for targeted rule lookup. This is a current upstream reference, rather than a verified copy of the skill's June 2026 snapshot.
 
-The execution host is Linux and initially offers g++ but no Windows/MSVC SDK, MinGW, Wine, CMake, or clang-tidy. A MinGW GCC 14 toolchain and CMake were acquired under /tmp for supplementary compilation. All production sources, six test suites, an inventory executable, and an overlay fixture DLL compile and link. Supported MSVC builds and Windows execution still need CI; live administrator-prompt behavior needs manual Windows verification.
+The execution host is Linux and initially offers g++ but no Windows/MSVC SDK, MinGW, Wine, CMake, or clang-tidy. A MinGW GCC 14 toolchain and CMake were acquired under /tmp for supplementary compilation. All production sources, test suites, an inventory executable, and an overlay fixture DLL compile and link. Supported MSVC builds, analysis, and Windows execution are performed through GitHub Actions; live administrator-prompt behavior needs manual Windows verification.
 
 Initial review identified copyable objects with pointers into their own storage, missing explicit special-member policies, unchecked binary extents, a temporary-journal cleanup ordering issue, and implicit DWORD-to-int exit-status conversion.
+
+Native Windows tests additionally exposed an invalid-handle sentinel accepted as a process pseudo-handle, optional-file status behavior, Common Controls activation-context requirements in test binaries, and a missing native rename filename terminator. These were corrected without weakening warnings or omitting failed tests. Raw argument and nullable logger patterns in fixtures were simplified into direct ownership where Microsoft's experimental lifetime model could not follow their original ownership.
 
 ## Decision Log
 
@@ -44,7 +46,7 @@ On 2026-10-16, native MSVC analysis reported valid owner lifetimes as invalid af
 ## Outcomes & Retrospective
 
 
-Production review and corrective implementation are complete. Six suites now cover command-line quoting, resource/conversion helpers, application sessions, ACL/recovery, elevation/IPC, and runtime discovery/repair helpers. All binaries cross-compile and link with MinGW warnings as errors; all thirteen public headers compile independently and on repeated inclusion. Independent cross-review found and resolved exception-copy safety, an overly broad test deny mask, and an incorrect test error expectation. Pull request 18 is open as a draft. Native CI has compiled the project and exposed analyzer-model limitations, now addressed with direct construction and documented statement-level exceptions. Supported Windows test outcomes and measured coverage remain pending.
+Production review and corrective implementation are complete. Nine suites cover command-line quoting, resource/conversion helpers, application sessions and entry failures, ACL/recovery, elevation/IPC, runtime helpers, finite process-observation failures, confined repair workflows, and actual production dialogs/entry. All binaries cross-compile and link with MinGW warnings as errors; all thirteen public headers compile independently and on repeated inclusion. Independent cross-review found and resolved exception-copy safety, an overly broad test deny mask, incorrect error expectations, and canonical Windows path comparisons in a test. Separate final production reviewers reported no actionable regressions outside their original file ownership. Pull request 18 is open as a draft. Native production builds and selected analysis pass in Debug/Release; final expanded-suite outcomes and measured coverage remain pending.
 
 ## Context and Orientation
 
@@ -67,7 +69,7 @@ From /workspace/D2SteamFix, inspect tracked files using git ls-files and rg. Use
 
 Portable command-line expectations pass with g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror -Iinclude tests/command_line_tests.cpp src/command_line.cpp -o /tmp/d2steamfix-command-line-tests followed by running that executable.
 
-On a 64-bit Windows Visual Studio Developer command prompt, run make.cmd test, make.cmd analyze, and make.cmd coverage. Coverage requires OpenCppCoverage 0.9.9.0 and Python. CI builds Debug/Release with STEAMFIX_ENABLE_CODE_ANALYSIS=ON, runs all six suites, and collects Debug coverage. Reports are written under build/coverage in CI; make.cmd coverage writes build-coverage/coverage locally. See docs/BUILDING.md for complete direct CMake commands.
+On a 64-bit Windows Visual Studio Developer command prompt, run make.cmd test, make.cmd analyze, and make.cmd coverage. Coverage requires OpenCppCoverage 0.9.9.0 and Python. CI builds Debug/Release with STEAMFIX_ENABLE_CODE_ANALYSIS=ON, runs all nine suites, and collects Debug coverage. Reports are written under build/coverage in CI; make.cmd coverage writes build-coverage/coverage locally. See docs/BUILDING.md for complete direct CMake commands.
 
 ## Validation and Acceptance
 

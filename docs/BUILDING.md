@@ -119,6 +119,10 @@ descriptors, and registry fixtures owned by the test. They cover:
   of permissions on fixture files.
 - Elevation helper validation, wire formats, overlapped pipe I/O, cancellation,
   and temporary privilege restoration without requesting UAC.
+- Broker startup, authentication, reuse, recovery after transport loss, and
+  administrator handoff through a scoped shell substitute that starts only the
+  same test executable. These cases require an already elevated test token;
+  actual UAC consent and alternate-account behavior remain manual checks.
 - Path and Steam-directory validation, process discovery and termination of
   fixture children, overlay-module identification, and repair helper behavior.
 - Recovery from finite process-observation failures while monitoring real

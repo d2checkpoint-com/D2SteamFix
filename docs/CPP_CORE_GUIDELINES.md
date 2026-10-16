@@ -145,6 +145,14 @@ and dismisses real production dialogs belonging to its own children and tests
 the built wrapper's invalid-invocation entry point. An unavailable desktop is
 reported as a skip, never as successful UI validation.
 
+Broker startup, reuse, transport-loss recovery, and administrator handoff tests
+intercept the shell `runas` boundary and start only the same test executable with
+ordinary `CreateProcessW`. These cases require an already elevated token. A
+scoped parent-only elevation-report override reaches the relaunch path; helper
+children use their actual token, process/pipe identity checks, and handle
+duplication. This covers the coordinator protocol without claiming UAC consent
+or alternate-account validation.
+
 Independent reviewers checked production changes outside their original file
 ownership, then cross-reviewed the integrated test boundaries, native contracts,
 cleanup lifetimes, and coverage inventory. Findings were resolved before the

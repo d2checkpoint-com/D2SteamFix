@@ -32,6 +32,7 @@ struct Plan {
     bool parse_failure = false;
     bool executable_failure = false;
     bool existing_session = false;
+    bool unexpected_startup_failure = false;
 };
 
 struct UnexpectedFailure final {};
@@ -80,6 +81,7 @@ private:
 };
 
 LPCWSTR command_line() {
+    if (active != nullptr && active->unexpected_startup_failure) throw UnexpectedFailure{};
     return active != nullptr && !active->entry_command.empty()
                ? active->entry_command.c_str() : ::GetCommandLineW();
 }
@@ -207,9 +209,10 @@ std::optional<int> app_test_relaunch(const std::vector<std::wstring>& arguments,
         return relaunch_as_administrator(arguments, directory, steam_directory);
     }
     ++app_fault::retry_calls;
-    if (arguments.size() != 2 || fs::path(arguments.front()) != app_fault::active->launcher ||
+    if (arguments.size() != 2 || !paths::equal_windows(fs::path(arguments.front()), app_fault::active->launcher) ||
         arguments.back() != L"--fixture-launcher" ||
-        directory != app_fault::active->launcher.parent_path() || steam_directory != app_fault::active->steam ||
+        !paths::equal_windows(directory, app_fault::active->launcher.parent_path()) ||
+        !paths::equal_windows(steam_directory, app_fault::active->steam) ||
         fs::exists(directory / L"steamfix.dat")) {
         throw std::logic_error("administrator retry preceded restoration or escaped its fixture");
     }
@@ -590,8 +593,14 @@ void check_session(const fs::path& directory) {
         const app_fault::Scope faults(plan);
         const int expected = retry == app_fault::Retry::status ? 23 :
                              retry == app_fault::Retry::failure ? static_cast<int>(ExitCode::process_creation) : 0;
-        require(app::entry() == expected && app_fault::retry_calls == 1 && app_fault::retry_restored,
-                "entry administrator retry follows restoration and preserves its outcome");
+        const int status = app::entry();
+        if (status != expected || app_fault::retry_calls != 1 || !app_fault::retry_restored) {
+            throw std::runtime_error("entry administrator retry: status=" + std::to_string(status) +
+                                     ", expected=" + std::to_string(expected) + ", calls=" +
+                                     std::to_string(app_fault::retry_calls) + ", restored=" +
+                                     std::to_string(app_fault::retry_restored) + ": " +
+                                     read_file(game / L"steamfix.log"));
+        }
         require(app_fault::error_messages == (retry == app_fault::Retry::failure ? 1 : 0),
                 "entry reports administrator retry failures without treating cancellation as an error");
         check_restored();
@@ -609,13 +618,13 @@ void check_session(const fs::path& directory) {
                 "entry emits exactly one diagnostic for a noncancelled failure");
         check_restored();
     }
-    for (int failure = 0; failure < 3; ++failure) {
+    for (int failure = 0; failure < 4; ++failure) {
         const app_fault::Plan plan{app_fault::Kind::process_error, ERROR_BAD_EXE_FORMAT, false, steam,
                                    0, entry_command, launcher, app_fault::Retry::status,
-                                   failure == 0, failure == 1, failure == 2};
+                                   failure == 0, failure == 1, failure == 2, failure == 3};
         const app_fault::Scope faults(plan);
         const int expected = static_cast<int>(failure == 0 ? ExitCode::invalid_invocation :
-                                              failure == 1 ? ExitCode::internal : ExitCode::existing_session);
+                                              failure == 2 ? ExitCode::existing_session : ExitCode::internal);
         require(app::entry() == expected && app_fault::retry_calls == 0 && app_fault::error_messages == 1,
                 "entry rejects startup failures inside its nonthrowing boundary");
         check_restored();

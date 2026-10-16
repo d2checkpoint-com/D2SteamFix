@@ -1,12 +1,224 @@
 // Exercise the actual private protocol and Win32 helpers without starting UAC.
-#include "../src/elevation.cpp"
+#include "steamfix/elevation.hpp"
 
+#include <aclapi.h>
+#include <objbase.h>
+#include <sddl.h>
+#include <shellapi.h>
+#include <shlobj.h>
+
+#include <atomic>
 #include <exception>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <thread>
 #include <utility>
+
+namespace elevation_fault {
+BOOL WINAPI shell_execute(SHELLEXECUTEINFOW* execute);
+BOOL WINAPI token_information(HANDLE token, TOKEN_INFORMATION_CLASS information_class,
+                              LPVOID information, DWORD bytes, PDWORD returned);
+}
+
+// Only the shell consent boundary and the selected parent's elevation report
+// are simulated. Pipes, authentication, processes, token reads in children,
+// file access, handle duplication, and waits remain real production operations.
+#define ShellExecuteExW ::elevation_fault::shell_execute
+#define GetTokenInformation ::elevation_fault::token_information
+#include "../src/elevation.cpp"
+#undef GetTokenInformation
+#undef ShellExecuteExW
+
+namespace elevation_fault {
+
+constexpr std::wstring_view exit_switch = L"--steamfix-test-shell-exit";
+constexpr std::wstring_view relaunch_switch = L"--steamfix-test-handoff";
+constexpr DWORD child_status = 37;
+
+void check(const bool condition, const char* message) {
+    if (!condition) throw std::runtime_error(message);
+}
+
+class ChildGuardian final {
+public:
+    explicit ChildGuardian(const HANDLE process)
+        : process_(duplicate(process)), wake_(CreateEventW(nullptr, TRUE, FALSE, nullptr)),
+          watchdog_([this] {
+              const std::array waits{process_.get(), wake_.get()};
+              if (WaitForMultipleObjects(static_cast<DWORD>(waits.size()), waits.data(), FALSE, 10000) == WAIT_TIMEOUT) {
+                  timed_out_.store(true);
+                  TerminateProcess(process_.get(), ERROR_TIMEOUT);
+              }
+          }) {}
+    ~ChildGuardian() noexcept {
+        SetEvent(wake_.get());
+        if (WaitForSingleObject(process_.get(), 0) == WAIT_TIMEOUT) {
+            TerminateProcess(process_.get(), ERROR_CANCELLED);
+            WaitForSingleObject(process_.get(), 3000);
+        }
+        // watchdog_ joins before its event and process-handle owners disappear.
+    }
+    ChildGuardian(const ChildGuardian&) = delete;
+    ChildGuardian& operator=(const ChildGuardian&) = delete;
+    ChildGuardian(ChildGuardian&&) = delete;
+    ChildGuardian& operator=(ChildGuardian&&) = delete;
+    DWORD wait() const {
+        check(WaitForSingleObject(process_.get(), 10000) == WAIT_OBJECT_0, "The owned shell child did not exit");
+        check(!timed_out_.load(), "The owned shell child exceeded its ten-second watchdog");
+        DWORD status{};
+        if (!GetExitCodeProcess(process_.get(), &status)) steamfix::elevation::fail(GetLastError());
+        return status;
+    }
+    void terminate() const {
+        if (!TerminateProcess(process_.get(), ERROR_CANCELLED)) steamfix::elevation::fail(GetLastError());
+        check(wait() == ERROR_CANCELLED, "The exclusively owned helper did not terminate as requested");
+    }
+private:
+    static steamfix::UniqueHandle duplicate(const HANDLE process) {
+        HANDLE result{};
+        if (!DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(), &result,
+                              PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, 0)) {
+            steamfix::elevation::fail(GetLastError());
+        }
+        return steamfix::UniqueHandle(result);
+    }
+    steamfix::UniqueHandle process_;
+    steamfix::UniqueHandle wake_;
+    std::atomic<bool> timed_out_ = false;
+    std::jthread watchdog_;
+};
+
+enum class Mode { launch, cancel, exit_before_connection };
+
+struct Plan {
+    std::filesystem::path self;
+    std::filesystem::path directory;
+    bool report_unelevated = false;
+    Mode mode = Mode::launch;
+    std::size_t shell_calls = 0;
+    std::vector<std::unique_ptr<ChildGuardian>> children;
+};
+
+thread_local Plan* active = nullptr;
+
+bool real_elevated() {
+    HANDLE raw{};
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) steamfix::elevation::fail(GetLastError());
+    const steamfix::UniqueHandle token(raw);
+    TOKEN_ELEVATION information{};
+    DWORD returned{};
+    if (!::GetTokenInformation(token.get(), TokenElevation, &information, sizeof(information), &returned)) {
+        steamfix::elevation::fail(GetLastError());
+    }
+    return information.TokenIsElevated != 0;
+}
+
+class Scope final {
+public:
+    explicit Scope(Plan& plan) : previous_(active) {
+        check(real_elevated(), "The simulated shell boundary requires a real elevated parent token");
+        active = &plan;
+    }
+    ~Scope() noexcept { active = previous_; }
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+    Scope(Scope&&) = delete;
+    Scope& operator=(Scope&&) = delete;
+private:
+    Plan* previous_;
+};
+
+BOOL WINAPI token_information(const HANDLE token, const TOKEN_INFORMATION_CLASS information_class,
+                              const LPVOID information, const DWORD bytes, const PDWORD returned) {
+    const BOOL result = ::GetTokenInformation(token, information_class, information, bytes, returned);
+    if (result && active != nullptr && active->report_unelevated && information_class == TokenElevation) {
+        check(information != nullptr && bytes >= sizeof(TOKEN_ELEVATION), "Invalid elevation-report fixture buffer");
+        auto& elevation = *static_cast<TOKEN_ELEVATION*>(information);
+        check(elevation.TokenIsElevated != 0, "A fixture attempted to simulate elevation from an unelevated token");
+        elevation.TokenIsElevated = 0;
+    }
+    return result;
+}
+
+bool validate_shell_request(const SHELLEXECUTEINFOW* execute) {
+    check(active != nullptr, "An unscoped shell call was blocked to prevent a UAC prompt");
+    check(execute != nullptr && execute->cbSize == sizeof(*execute) && execute->lpVerb != nullptr &&
+          std::wstring_view(execute->lpVerb) == L"runas" && execute->lpFile != nullptr &&
+          steamfix::paths::equal_windows(std::filesystem::path(execute->lpFile), active->self) &&
+          execute->lpParameters != nullptr &&
+          execute->fMask == (SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC),
+          "The simulated shell request escaped its same-executable boundary");
+    std::wstring parsed_command = L"fixture.exe ";
+    parsed_command += execute->lpParameters;
+    int count{};
+    LPWSTR* raw = CommandLineToArgvW(parsed_command.c_str(), &count);
+    if (raw == nullptr) steamfix::elevation::fail(GetLastError());
+    const steamfix::LocalMemory memory(raw);
+    if (count != 4 && count != 7) {
+        throw std::runtime_error("The simulated shell request has invalid private arguments");
+    }
+    const std::span<wchar_t* const> parsed_arguments(raw, static_cast<std::size_t>(count));
+    std::vector<std::wstring> arguments;
+    arguments.reserve(parsed_arguments.size());
+    for (const auto* argument : parsed_arguments) arguments.emplace_back(argument);
+    const bool helper = std::wstring_view(arguments[1]) == steamfix::elevation::helper_switch;
+    check(std::wstring_view(arguments[2]) == std::to_wstring(GetCurrentProcessId()),
+          "The simulated shell request did not authenticate this parent");
+    if (helper) {
+        const std::wstring_view pipe(arguments[3]);
+        check(count == 4 && pipe.starts_with(L"\\\\.\\pipe\\D2SteamFix-") && pipe.size() <= 100 &&
+              execute->lpDirectory == nullptr && execute->nShow == SW_HIDE,
+              "The simulated helper shell request is not confined to its private pipe");
+    } else {
+        check(count == 7 && std::wstring_view(arguments[1]) == steamfix::elevation::elevated_launch_switch &&
+              steamfix::paths::equal_windows(std::filesystem::path(arguments[3]), active->directory) &&
+              std::wstring_view(arguments[4]) == relaunch_switch &&
+              std::wstring_view(arguments[5]) == std::to_wstring(child_status) &&
+              steamfix::paths::equal_windows(std::filesystem::path(arguments[6]), active->directory) &&
+              execute->lpDirectory != nullptr &&
+              steamfix::paths::equal_windows(std::filesystem::path(execute->lpDirectory), active->directory) &&
+              execute->nShow == SW_SHOWNORMAL,
+              "The simulated handoff shell request escaped its fixture directory");
+    }
+    return helper;
+}
+
+BOOL WINAPI shell_execute(SHELLEXECUTEINFOW* execute) {
+    const bool helper = validate_shell_request(execute);
+    ++active->shell_calls;
+    if (active->mode == Mode::cancel) {
+        SetLastError(ERROR_CANCELLED);
+        return FALSE;
+    }
+    std::wstring command;
+    steamfix::command_line::append_quoted(command, active->self.native());
+    if (active->mode == Mode::exit_before_connection) {
+        check(helper, "Premature-exit simulation is confined to helper startup");
+        steamfix::command_line::append_quoted(command, exit_switch);
+    } else {
+        command.push_back(L' ');
+        command += execute->lpParameters;
+    }
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION information{};
+    if (!CreateProcessW(active->self.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, execute->lpDirectory, &startup, &information)) return FALSE;
+    const steamfix::UniqueHandle thread(information.hThread);
+    steamfix::UniqueHandle process(information.hProcess);
+    try {
+        active->children.push_back(std::make_unique<ChildGuardian>(process.get()));
+    } catch (...) {
+        TerminateProcess(process.get(), ERROR_CANCELLED);
+        WaitForSingleObject(process.get(), 10000);
+        throw;
+    }
+    execute->hProcess = process.release();
+    return TRUE;
+}
+
+} // namespace elevation_fault
 
 namespace {
 
@@ -672,6 +884,106 @@ void check_authenticated_helper() {
     }
 }
 
+void check_broker_and_relaunch_boundaries() {
+    if (!elevation_fault::real_elevated()) {
+        std::cout << "SKIP: broker/relaunch shell-boundary fixtures require an already elevated token; no UAC is started.\n";
+        return;
+    }
+    TemporaryDirectory fixture;
+    const fs::path& directory = fixture.path();
+    create_file(directory / L"steam.exe");
+    const fs::path renderer = directory / L"GameOverlayRenderer64.dll";
+    constexpr std::string_view contents = "broker renderer fixture";
+    create_file(renderer, contents);
+    const fs::path self = elevation::executable_path();
+
+    elevation_fault::Plan broker_plan;
+    broker_plan.self = self;
+    broker_plan.directory = directory;
+    broker_plan.mode = elevation_fault::Mode::cancel;
+    {
+        const elevation_fault::Scope boundary(broker_plan);
+        {
+            elevation::Broker broker;
+            expect_error([&] { broker.ensure_started(); }, ERROR_CANCELLED);
+            require(broker_plan.shell_calls == 1 && broker_plan.children.empty(),
+                    "A cancelled shell request started a child");
+            broker_plan.mode = elevation_fault::Mode::launch;
+            broker.ensure_started();
+            broker.ensure_started();
+            require(broker_plan.shell_calls == 2 && broker_plan.children.size() == 1,
+                    "A healthy broker did not reuse its authenticated helper");
+            elevation::Request request{};
+            request.operation = static_cast<elevation::Operation>(MAXDWORD);
+            expect_error([&] { static_cast<void>(broker.request(request)); }, ERROR_INVALID_DATA);
+            request.operation = elevation::Operation::open_file;
+            request.access = FILE_READ_DATA;
+            request.share = FILE_SHARE_READ;
+            request.creation = OPEN_EXISTING;
+            expect_error([&] {
+                static_cast<void>(broker.request(request, fs::path(L"C:\\" + std::wstring(elevation::max_path_units, L'x'))));
+            }, ERROR_BAD_PATHNAME);
+            const auto response = broker.request(request, renderer);
+            require(response.handle != 0 && broker_plan.shell_calls == 2,
+                    "An application error incorrectly dropped the broker connection");
+            steamfix::UniqueHandle transferred(reinterpret_cast<HANDLE>(response.handle));
+            std::array<char, 128> bytes{};
+            DWORD read{};
+            require(ReadFile(transferred.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) &&
+                    std::string_view(bytes.data(), read) == contents,
+                    "A real broker response did not transfer a readable fixture handle");
+            transferred.reset();
+
+            broker_plan.children.front()->terminate();
+            bool transport_failed = false;
+            try {
+                static_cast<void>(broker.request(request, renderer));
+            } catch (const std::system_error& error) {
+                const DWORD code = static_cast<DWORD>(error.code().value());
+                require(error.code().category() == std::system_category() &&
+                        (code == ERROR_BROKEN_PIPE || code == ERROR_NO_DATA || code == ERROR_PIPE_NOT_CONNECTED),
+                        "The terminated helper did not produce a pipe transport failure");
+                transport_failed = true;
+            }
+            require(transport_failed, "A broker exchange succeeded after its owned helper exited");
+            const auto retried = broker.request(request, renderer);
+            require(retried.handle != 0 && broker_plan.shell_calls == 3 && broker_plan.children.size() == 2,
+                    "A failed transport did not start a fresh authenticated helper");
+            const steamfix::UniqueHandle retry_handle(reinterpret_cast<HANDLE>(retried.handle));
+        }
+        require(broker_plan.children.back()->wait() == ERROR_SUCCESS,
+                "Destroying the local broker left its helper waiting on the pipe");
+    }
+
+    elevation_fault::Plan early_exit;
+    early_exit.self = self;
+    early_exit.directory = directory;
+    early_exit.mode = elevation_fault::Mode::exit_before_connection;
+    {
+        const elevation_fault::Scope boundary(early_exit);
+        elevation::Broker broker;
+        expect_error([&] { broker.ensure_started(); }, ERROR_BROKEN_PIPE);
+        require(early_exit.children.size() == 1 && early_exit.children.front()->wait() == elevation_fault::child_status,
+                "The broker did not observe its owned helper exit before connecting");
+    }
+
+    elevation_fault::Plan relaunch;
+    relaunch.self = self;
+    relaunch.directory = directory;
+    relaunch.report_unelevated = true;
+    const std::vector<std::wstring> forwarded{std::wstring(elevation_fault::relaunch_switch),
+        std::to_wstring(elevation_fault::child_status), directory.native()};
+    {
+        const elevation_fault::Scope boundary(relaunch);
+        const auto result = elevation::relaunch_as_administrator(forwarded, directory, directory);
+        require(result == steamfix::windows_exit_status(elevation_fault::child_status) &&
+                relaunch.shell_calls == 1 && relaunch.children.size() == 1 &&
+                relaunch.children.front()->wait() == elevation_fault::child_status,
+                "The private relaunch did not authenticate its child, forward context, and preserve exit status");
+    }
+    require(elevation::is_elevated(), "A scoped elevation-report simulation escaped into later tests");
+}
+
 void check_errors_and_entry_points() {
     require(elevation::permission_denied(ERROR_ACCESS_DENIED) &&
             elevation::permission_denied(ERROR_PRIVILEGE_NOT_HELD) &&
@@ -738,11 +1050,30 @@ int main() {
             arguments.emplace_back(argument);
         }
         if (const auto status = elevation::dispatch_helper(arguments)) return *status;
+        if (!arguments.empty() && arguments.front() == elevation_fault::exit_switch) {
+            require(arguments.size() == 1, "A premature-exit fixture received unexpected arguments");
+            return steamfix::windows_exit_status(elevation_fault::child_status);
+        }
+        if (!arguments.empty() && arguments.front() == elevation::elevated_launch_switch) {
+            const auto inherited = elevation::accept_elevated_launch(arguments);
+            require(inherited && arguments.size() == 3 && arguments[0] == elevation_fault::relaunch_switch &&
+                    arguments[1] == std::to_wstring(elevation_fault::child_status) &&
+                    steamfix::paths::equal_windows(*inherited, fs::canonical(fs::path(arguments[2]))),
+                    "The elevated handoff changed its authenticated directory or forwarded arguments");
+            for (const auto* name : {L"SteamAppId", L"SteamGameId"}) {
+                std::array<wchar_t, 16> value{};
+                require(GetEnvironmentVariableW(name, value.data(), static_cast<DWORD>(value.size())) == 7 &&
+                        std::wstring_view(value.data()) == L"1085660",
+                        "The elevated handoff did not establish the child's Steam context");
+            }
+            return steamfix::windows_exit_status(elevation_fault::child_status);
+        }
         check_protocol_and_transport();
         check_paths_and_file_operations();
         check_privilege_restoration();
         check_errors_and_entry_points();
         check_authenticated_helper();
+        check_broker_and_relaunch_boundaries();
     } catch (const std::exception& error) {
         std::cerr << "Elevation regression test failed: " << error.what() << '\n';
         return 1;
