@@ -1,6 +1,6 @@
 # D2SteamFix
 
-D2SteamFix is a launch wrapper for the Steam version of Destiny 2 on 64-bit Windows. It aims to reduce frame pacing and stuttering issues by temporarily blocking Steam's overlay renderer while you play, then restoring its original permissions after the game exits.
+D2SteamFix is a launch wrapper for the Steam version of Destiny 2. It aims to reduce frame pacing and stuttering issues by temporarily blocking Steam's overlay renderer while you play, then restoring its original permissions after the game exits.
 
 Blocking the Steam overlay can also affect Steam Input, notifications, Game Recording, and Remote Play. During normal game launches, D2SteamFix changes only the overlay files' permissions, leaving their contents intact. The separate repair mode described below asks Steam to replace its overlay files. D2SteamFix does not inject code, inspect process memory, modify game files, change Steam configuration, or bypass BattlEye.
 
@@ -28,8 +28,6 @@ Replace `C:\path\to\Destiny 2` with the actual location of your Destiny 2 instal
 ## Playing Destiny 2
 
 Start Destiny 2 from Steam as usual. D2SteamFix blocks the overlay before starting the game and restores its permissions when the game exits.
-
-D2SteamFix supports normal and administrator launches. If Windows blocks a required permission change or launcher operation, it requests permission through the Windows administrator prompt. Cancelling the prompt stops the launch and restores any permissions already changed.
 
 ## Interrupted Sessions
 
