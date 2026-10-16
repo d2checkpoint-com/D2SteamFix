@@ -1,6 +1,7 @@
 #include "steamfix/acl.hpp"
 
 #include "steamfix/error.hpp"
+#include "steamfix/elevation.hpp"
 #include "steamfix/logging.hpp"
 #include "steamfix/paths.hpp"
 #include "steamfix/win32.hpp"
@@ -243,11 +244,8 @@ struct OpenedTarget {
 
 OpenedTarget open_target(const fs::path& path, const DWORD desired_access) {
     validate_target_name(path);
-    HANDLE raw = CreateFileW(path.c_str(), desired_access,
-                             FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
-                             FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    if (raw == INVALID_HANDLE_VALUE) throw_win32(GetLastError());
-    UniqueHandle handle(raw);
+    UniqueHandle handle = elevation::open_file(path, desired_access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT);
     BY_HANDLE_FILE_INFORMATION information{};
     if (!GetFileInformationByHandle(handle.get(), &information)) throw_win32(GetLastError());
     if ((information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
@@ -334,6 +332,7 @@ public:
                                    FILE_ALL_ACCESS, system_sid_.data()) ||
             !InitializeSecurityDescriptor(&descriptor_, SECURITY_DESCRIPTOR_REVISION) ||
             !SetSecurityDescriptorDacl(&descriptor_, TRUE, acl_, FALSE) ||
+            !SetSecurityDescriptorOwner(&descriptor_, user_sid, FALSE) ||
             !SetSecurityDescriptorControl(&descriptor_, SE_DACL_PROTECTED,
                                           SE_DACL_PROTECTED)) {
             throw_win32(GetLastError());
@@ -372,6 +371,26 @@ HANDLE open_access_raw(const fs::path& path, const DWORD access) {
 }
 
 void verify_denied(const Backup& backup, HANDLE handle);
+
+bool has_current_user_execute_deny(const Backup& backup, PSID sid) {
+    const DescriptorParts original = descriptor_parts(backup.descriptor);
+    if (original.dacl == nullptr) return false;
+    ACL_SIZE_INFORMATION size{};
+    if (!GetAclInformation(original.dacl, &size, sizeof(size), AclSizeInformation)) {
+        throw_win32(GetLastError());
+    }
+    for (DWORD index = 0; index < size.AceCount; ++index) {
+        void* ace = nullptr;
+        if (!GetAce(original.dacl, index, &ace)) throw_win32(GetLastError());
+        const auto* header = static_cast<const ACE_HEADER*>(ace);
+        if (header->AceType != ACCESS_DENIED_ACE_TYPE ||
+            (header->AceFlags & INHERITED_ACE) != 0) continue;
+        const auto* denied = static_cast<const ACCESS_DENIED_ACE*>(ace);
+        if ((denied->Mask & FILE_EXECUTE) != 0 &&
+            EqualSid(const_cast<DWORD*>(&denied->SidStart), sid)) return true;
+    }
+    return false;
+}
 
 std::vector<std::byte> make_denied_acl(const Backup& backup, PSID sid) {
     const DescriptorParts old = descriptor_parts(backup.descriptor);
@@ -413,12 +432,7 @@ std::vector<std::byte> make_denied_acl(const Backup& backup, PSID sid) {
     return acl_data;
 }
 
-void deny(const Backup& backup, const HANDLE handle) {
-    const DescriptorParts old = descriptor_parts(backup.descriptor);
-    PACL denied_acl = acl_from_bytes(backup.denied_acl);
-    const DWORD status = SetSecurityInfo(handle, SE_FILE_OBJECT, old.information,
-                                         nullptr, nullptr, denied_acl, nullptr);
-    if (status != ERROR_SUCCESS) throw_win32(status);
+void verify_protection(const Backup& backup, const HANDLE handle) {
     verify_denied(backup, handle);
 
     HANDLE readable_raw = open_access_raw(backup.path, GENERIC_READ);
@@ -438,6 +452,15 @@ void deny(const Backup& backup, const HANDLE handle) {
     if (error != ERROR_ACCESS_DENIED) {
         throw std::runtime_error("could not verify the execute-only deny ACE: " + windows_error(error));
     }
+}
+
+void deny(const Backup& backup, const HANDLE handle) {
+    const DescriptorParts old = descriptor_parts(backup.descriptor);
+    PACL denied_acl = acl_from_bytes(backup.denied_acl);
+    const DWORD status = SetSecurityInfo(handle, SE_FILE_OBJECT, old.information,
+                                         nullptr, nullptr, denied_acl, nullptr);
+    if (status != ERROR_SUCCESS) throw_win32(status);
+    verify_protection(backup, handle);
 }
 
 bool acl_equal(PACL left, PACL right) {
@@ -793,28 +816,22 @@ void write_state(const fs::path& path, const std::span<const Backup> backups,
     fs::path temporary = path;
     temporary += L".tmp";
     RestrictedSecurity security(user_sid, 0);
-    HANDLE raw = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, security.attributes(),
-                             CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (raw == INVALID_HANDLE_VALUE) throw_win32(GetLastError());
+    UniqueHandle file = elevation::open_file(temporary, GENERIC_WRITE, 0, CREATE_NEW,
+                                               FILE_ATTRIBUTE_NORMAL, security.attributes());
     try {
-        UniqueHandle file(raw);
         write_all(file.get(), data);
         if (!FlushFileBuffers(file.get())) throw_win32(GetLastError());
         file.reset();
-        if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH)) {
-            throw_win32(GetLastError());
-        }
+        elevation::move_recovery_file(temporary, path);
     } catch (...) {
-        DeleteFileW(temporary.c_str());
+        try { elevation::remove_recovery_file(temporary); } catch (...) {}
         throw;
     }
 }
 
 std::vector<RecoveryEntry> read_state(const fs::path& path) {
-    HANDLE raw = CreateFileW(path.c_str(), GENERIC_READ | READ_CONTROL | WRITE_DAC, 0, nullptr,
-                             OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-    if (raw == INVALID_HANDLE_VALUE) throw_win32(GetLastError());
-    UniqueHandle file(raw);
+    UniqueHandle file = elevation::open_file(path, GENERIC_READ | READ_CONTROL | WRITE_DAC,
+                                               0, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT);
     BY_HANDLE_FILE_INFORMATION information{};
     if (!GetFileInformationByHandle(file.get(), &information)) throw_win32(GetLastError());
     if ((information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0) {
@@ -849,7 +866,29 @@ std::vector<RecoveryEntry> read_state(const fs::path& path) {
 }
 
 AppError protection_error(const char* stage, const std::exception& error) {
+    if (dynamic_cast<const elevation::Cancelled*>(&error) != nullptr) throw elevation::Cancelled();
     return AppError(ExitCode::overlay_protection, stage, error.what());
+}
+
+void remove_incomplete_state(const fs::path& path, const Logger& log) {
+    fs::path temporary = path;
+    temporary += L".tmp";
+    std::error_code error;
+    const bool exists = fs::exists(temporary, error);
+    if (error) {
+        throw protection_error("ACL recovery",
+                               fs::filesystem_error("inspect temporary recovery file", temporary, error));
+    }
+    if (exists) {
+        try {
+            if (!elevation::remove_recovery_file(temporary)) {
+                throw std::runtime_error("could not remove temporary recovery file");
+            }
+        } catch (const std::exception& exception) {
+            throw protection_error("ACL recovery cleanup", exception);
+        }
+        log.warn("removed an incomplete ACL recovery temporary file");
+    }
 }
 
 struct PreparedRecovery {
@@ -893,26 +932,13 @@ std::optional<PreparedRecovery> prepare_recovery_entry(const RecoveryEntry& entr
 
 } // namespace
 
-fs::path recovery_path(const fs::path& working_directory) {
-    return working_directory / L"steamfix.dat";
+fs::path recovery_path(const fs::path& game_directory) {
+    return game_directory / L"steamfix.dat";
 }
 
 bool recover_pending(const fs::path& path, const Logger& log) {
-    fs::path temporary = path;
-    temporary += L".tmp";
+    remove_incomplete_state(path, log);
     std::error_code error;
-    const bool temporary_exists = fs::exists(temporary, error);
-    if (error) {
-        throw protection_error("ACL recovery",
-                               fs::filesystem_error("inspect temporary recovery file", temporary, error));
-    }
-    if (temporary_exists) {
-        if (!fs::remove(temporary, error) || error) {
-            throw AppError(ExitCode::overlay_protection, "ACL recovery cleanup",
-                           error ? error.message() : "could not remove temporary recovery file");
-        }
-        log.warn("removed an incomplete ACL recovery temporary file");
-    }
     const bool state_exists = fs::exists(path, error);
     if (error) {
         throw protection_error("ACL recovery",
@@ -945,8 +971,7 @@ bool recover_pending(const fs::path& path, const Logger& log) {
         for (const PreparedRecovery& target : prepared) {
             if (restore_one(target.entry->backup, target.writable.handle.get())) ++restored;
         }
-        const bool removed = fs::remove(path, error);
-        if (error) throw fs::filesystem_error("remove recovery file", path, error);
+        const bool removed = elevation::remove_recovery_file(path);
         if (!removed) throw std::runtime_error("recovery file disappeared before cleanup");
         log.info("processed renderer permission recovery state: restored=" +
                  std::to_string(restored) + ", skipped=" + std::to_string(skipped));
@@ -967,18 +992,59 @@ Protection Protection::apply(const std::vector<fs::path>& targets, fs::path stat
     std::vector<Backup> backups;
     std::vector<UniqueHandle> handles;
     std::vector<FileIdentity> identities;
+    bool resuming = false;
     try {
         backups.reserve(targets.size());
         handles.reserve(targets.size());
         identities.reserve(targets.size());
-        for (const fs::path& target : targets) {
-            OpenBackup opened = make_backup(target);
-            backups.push_back(std::move(opened.backup));
-            handles.push_back(std::move(opened.handle));
-            identities.push_back(opened.identity);
+        resuming = fs::exists(state_path);
+        if (resuming) {
+            std::vector<RecoveryEntry> entries = read_state(state_path);
+            if (entries.size() != targets.size()) {
+                throw std::runtime_error(
+                    "saved renderer set does not match the selected Steam renderer files; "
+                    "original recovery backup was preserved");
+            }
+            std::vector<bool> matched(entries.size(), false);
+            for (const fs::path& target : targets) {
+                size_t match = entries.size();
+                for (size_t index = 0; index < entries.size(); ++index) {
+                    if (!paths::equal_windows(target, entries[index].backup.path)) continue;
+                    if (matched[index] || match != entries.size()) {
+                        throw std::runtime_error("saved renderer set contains duplicate targets");
+                    }
+                    match = index;
+                }
+                if (match == entries.size()) {
+                    throw std::runtime_error("selected renderer is missing from the original "
+                                             "recovery backup: " + display_path(target));
+                }
+                try {
+                    std::optional<PreparedRecovery> prepared =
+                        prepare_recovery_entry(entries[match], log);
+                    if (!prepared) {
+                        throw std::runtime_error("renderer could not be safely matched to its "
+                                                 "original recovery backup");
+                    }
+                    matched[match] = true;
+                    backups.push_back(entries[match].backup);
+                    handles.push_back(std::move(prepared->writable.handle));
+                } catch (const elevation::Cancelled&) {
+                    throw;
+                } catch (const std::exception& error) {
+                    throw std::runtime_error(display_path(target) + ": " + error.what());
+                }
+            }
+        } else {
+            for (const fs::path& target : targets) {
+                OpenBackup opened = make_backup(target);
+                backups.push_back(std::move(opened.backup));
+                handles.push_back(std::move(opened.handle));
+                identities.push_back(opened.identity);
+            }
         }
     } catch (const std::exception& error) {
-        throw protection_error("ACL backup", error);
+        throw protection_error(resuming ? "ACL recovery validation" : "ACL backup", error);
     }
     UserIdentity identity = [] {
         try {
@@ -988,34 +1054,51 @@ Protection Protection::apply(const std::vector<fs::path>& targets, fs::path stat
         }
     }();
     try {
-        for (Backup& backup : backups) {
-            backup.denied_acl = make_denied_acl(backup, identity.sid);
+        if (!resuming) {
+            for (Backup& backup : backups) {
+                if (has_current_user_execute_deny(backup, identity.sid)) {
+                    throw std::runtime_error(
+                        "current-user execute access is already denied but no matching recovery "
+                        "backup was found; preserve any existing steamfix.dat files: " +
+                        display_path(backup.path));
+                }
+                backup.denied_acl = make_denied_acl(backup, identity.sid);
+            }
         }
     } catch (const std::exception& error) {
         throw protection_error("ACL protection preparation", error);
     }
     try {
-        write_state(state_path, backups, identities, identity.sid);
+        if (!resuming) {
+            remove_incomplete_state(state_path, log);
+            write_state(state_path, backups, identities, identity.sid);
+        }
+    } catch (const AppError&) {
+        throw;
     } catch (const std::exception& error) {
         throw protection_error("ACL recovery persistence", error);
     }
+    if (resuming) log.info("reusing original renderer permissions from existing recovery backup");
     for (size_t index = 0; index < backups.size(); ++index) {
         try {
-            deny(backups[index], handles[index].get());
-            log.info("temporarily denied current-user execute access: " +
-                     display_path(backups[index].path));
+            if (restoration_state(backups[index], handles[index].get()) == RestorationState::denied) {
+                verify_protection(backups[index], handles[index].get());
+                log.info("retained current-user execute denial from interrupted session: " +
+                         display_path(backups[index].path));
+            } else {
+                deny(backups[index], handles[index].get());
+                log.info("temporarily denied current-user execute access: " +
+                         display_path(backups[index].path));
+            }
         } catch (const std::exception& error) {
             bool restored = false;
             try {
-                const size_t rollback_count = index + 1;
-                restore_all(std::span(backups).first(rollback_count),
-                            std::span(handles).first(rollback_count));
+                restore_all(backups, handles);
                 restored = true;
             } catch (const std::exception&) {
             }
             if (restored) {
-                std::error_code cleanup_error;
-                fs::remove(state_path, cleanup_error);
+                try { elevation::remove_recovery_file(state_path); } catch (...) {}
             }
             throw AppError(ExitCode::overlay_protection, "renderer permission denial",
                            display_path(backups[index].path) + ": " + error.what());
@@ -1031,12 +1114,14 @@ void Protection::restore(const Logger& log) {
     } catch (const std::exception& error) {
         throw protection_error("ACL restoration", error);
     }
-    std::error_code error;
-    fs::remove(state_path_, error);
-    if (error) {
-        throw AppError(ExitCode::overlay_protection, "ACL recovery cleanup", error.message());
-    }
+    // Permission restoration is complete even if journal cleanup is declined.
+    // Do not repeat a cancelled elevation prompt from the destructor.
     state_ = State::restored;
+    try {
+        elevation::remove_recovery_file(state_path_);
+    } catch (const std::exception& error) {
+        throw protection_error("ACL recovery cleanup", error);
+    }
     log.info("restored original renderer permissions and removed recovery state");
 }
 
@@ -1044,9 +1129,8 @@ Protection::~Protection() {
     if (state_ != State::active) return;
     try {
         restore_all(backups_, handles_);
-        std::error_code error;
-        fs::remove(state_path_, error);
-        if (!error) state_ = State::restored;
+        elevation::remove_recovery_file(state_path_);
+        state_ = State::restored;
     } catch (const std::exception&) {
     }
 }

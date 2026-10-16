@@ -4,7 +4,7 @@
 |---:|---|
 | 10 | Invalid or direct invocation |
 | 11 | Log initialization failure |
-| 12 | Destiny 2, Steam App ID, or process-privilege validation failure |
+| 12 | Destiny 2 or Steam App ID validation failure |
 | 13 | Another SteamFix instance or existing Destiny 2 session |
 | 14 | Steam installation or renderer DLL discovery failure |
 | 15 | Overlay renderer already loaded into steamfix.exe |

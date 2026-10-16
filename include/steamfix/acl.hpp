@@ -46,7 +46,7 @@ private:
     State state_;
 };
 
-std::filesystem::path recovery_path(const std::filesystem::path& working_directory);
+std::filesystem::path recovery_path(const std::filesystem::path& game_directory);
 bool recover_pending(const std::filesystem::path& path, const Logger& log);
 
 } // namespace steamfix::acl
