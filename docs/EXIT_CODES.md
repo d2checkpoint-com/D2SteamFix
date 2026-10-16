@@ -2,7 +2,7 @@
 
 | Code | Meaning |
 |---:|---|
-| 10 | Invalid or direct invocation |
+| 10 | Invalid invocation |
 | 11 | Log initialization failure |
 | 12 | Destiny 2 or Steam App ID validation failure |
 | 13 | Another SteamFix instance or existing Destiny 2 session |

@@ -1,8 +1,8 @@
 # D2SteamFix
 
-D2SteamFix is a launch wrapper for Destiny 2 intended to help alleviate frame pacing and stuttering issues for Steam users. Before starting Destiny 2, it temporarily denies execute access to Steam's overlay renderer DLLs, then restores the original permissions after exiting the game.
+D2SteamFix is a launch wrapper for the Steam version of Destiny 2 on 64-bit Windows. It aims to reduce frame pacing and stuttering issues by temporarily blocking Steam's overlay renderer while you play, then restoring its original permissions after the game exits.
 
-Please note that blocking the Steam Overlay DLLs can also affect overlay-dependent features such as Steam Input, notifications, Game Recording, and Remote Play. During normal game launches, this program temporarily changes only the ACL metadata of the overlay DLLs; it does not alter their contents. The separate repair mode described below asks Steam to replace its overlay files. It does not inject code, inspect process memory, modify game files, change Steam configuration, or bypass BattlEye.
+Blocking the Steam overlay can also affect Steam Input, notifications, Game Recording, and Remote Play. During normal game launches, D2SteamFix changes only the overlay files' permissions, leaving their contents intact. The separate repair mode described below asks Steam to replace its overlay files. D2SteamFix does not inject code, inspect process memory, modify game files, change Steam configuration, or bypass BattlEye.
 
 ## Installation
 
@@ -23,9 +23,13 @@ Replace `C:\path\to\Destiny 2` with the actual location of your Destiny 2 instal
 "C:\Program Files (x86)\Steam\steamapps\common\Destiny 2\steamfix.exe" %command%
 ```
 
-D2SteamFix supports normal and administrator launches. If Windows blocks a required permission change or launcher operation, it requests permission through the Windows administrator prompt. Cancelling the prompt stops the launch and restores any permissions already changed.
-
 ![Steam Launch Options](https://static.d2checkpoint.com/steamfix_launch_options.png)
+
+## Playing Destiny 2
+
+Start Destiny 2 from Steam as usual. D2SteamFix blocks the overlay before starting the game and restores its permissions when the game exits.
+
+D2SteamFix supports normal and administrator launches. If Windows blocks a required permission change or launcher operation, it requests permission through the Windows administrator prompt. Cancelling the prompt stops the launch and restores any permissions already changed.
 
 ## Interrupted Sessions
 
@@ -39,41 +43,26 @@ If a saved backup no longer matches the renderer files or permissions, D2SteamFi
 
 Double-click `steamfix.exe` in the Destiny 2 directory to repair Steam's overlay files, including when a recovery backup is missing or unusable. D2SteamFix also offers this repair during a Steam launch if the overlay files already have blocked execute access and there is no backup.
 
-The dialog explains that Steam and Destiny 2 will close so Steam can repair its files. After you continue and approve any required Windows permission prompt, D2SteamFix closes those applications, removes `GameOverlayRenderer64.dll` and `GameOverlayRenderer.dll`, and starts Steam with `-forcesteamupdate -forcepackagedownload -exitsteam`. If Steam cannot be located, select its `steam.exe` in the file picker.
+The dialog explains that Steam and Destiny 2 will close so Steam can repair its files. After you continue and approve any required Windows permission prompt, D2SteamFix closes those applications, removes the affected overlay files, and starts Steam to download fresh copies. If Steam cannot be located, select its `steam.exe` in the file picker.
 
 After Steam exits and the repaired files are verified, D2SteamFix removes `steamfix.dat` and any `.tmp` or `.old` recovery files from the game directory, keeps all logs, and exits. Start Steam again when you are ready to play. Cancelling before repair leaves the files and applications unchanged. Recovery cleanup runs only after the repaired files are verified.
 
-## Building from Source
+## Removing D2SteamFix
 
-### Prerequisites
+1. Exit Destiny 2 normally so D2SteamFix can restore the overlay permissions. If `steamfix.dat` remains after the session ends, complete recovery or use the repair steps above before continuing.
+2. Remove the D2SteamFix command from Destiny 2's **Launch Options** in Steam.
+3. Delete `steamfix.exe` from the game directory if you no longer need it.
 
-Building D2SteamFix requires Windows and the Microsoft Visual C++ toolchain.
+## Troubleshooting
 
-Install either Visual Studio or Visual Studio Build Tools with the Desktop development with C++ workload selected. Make sure to include the MSVC compiler and a Windows SDK. Run the following commands from a Visual Studio Developer command prompt:
+If a launch fails, check `steamfix.log` in the Destiny 2 directory for details. The [exit code reference](docs/EXIT_CODES.md) explains the reported error codes. When [reporting a problem](https://github.com/d2checkpoint-com/D2SteamFix/issues), include the error message and relevant log entries; review them for personal paths before posting.
 
-```batch
-make.cmd configure
-```
-
-```batch
-make.cmd build
-```
-
-GitHub Actions builds both Debug and Release configurations on Windows x64 for pushes and pull requests. The executables are available as workflow artifacts.
-
-## Publishing a Release
-
-Update the version in `CMakeLists.txt` through a pull request, then tag the commit to release with the matching version and push the tag:
-
-```bash
-git tag -a v1.0.0 -m "D2SteamFix 1.0"
-git push origin v1.0.0
-```
-
-Use the new version for each subsequent release. Pushing a `vX.Y.Z` tag runs the same build checks, verifies that the tag matches the CMake project version, and publishes a GitHub release with `steamfix.exe` attached after both builds succeed. The tagged commit must contain the release workflow.
-
-## Windows Defender
+### Windows Defender
 
 The published binary may be flagged as a false positive by Windows Defender. This is a known issue and Microsoft has confirmed that it was a false positive and has removed it.
 
 If your Windows Defender still reports the old detection, [please follow these instructions to clear cached detections and update malware definitions.](docs/WINDOWS_DEFENDER.md)
+
+## Development
+
+See [Building from Source](docs/BUILDING.md) for build requirements and commands, and [AGENTS.md](AGENTS.md) for repository guidance.
