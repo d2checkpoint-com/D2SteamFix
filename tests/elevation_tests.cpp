@@ -303,7 +303,8 @@ void check_protocol_and_transport() {
 void check_paths_and_file_operations() {
     const fs::path archive_name(L"C:\\directory\\archive.old");
     const auto rename_bytes = elevation::rename_information(archive_name);
-    require(rename_bytes.size() == offsetof(FILE_RENAME_INFO, FileName) + archive_name.native().size() * sizeof(wchar_t),
+    const std::size_t filename_bytes = archive_name.native().size() * sizeof(wchar_t);
+    require(rename_bytes.size() == offsetof(FILE_RENAME_INFO, FileName) + filename_bytes + sizeof(wchar_t),
             "The native rename request has an unexpected byte length");
     require(std::ranges::all_of(std::span{rename_bytes}.first(offsetof(FILE_RENAME_INFO, FileNameLength)),
                                [](const std::byte byte) { return byte == std::byte{}; }),
@@ -313,9 +314,12 @@ void check_paths_and_file_operations() {
     require(native_rename.ReplaceIfExists == FALSE && native_rename.RootDirectory == nullptr &&
             native_rename.FileNameLength == archive_name.native().size() * sizeof(wchar_t),
             "The native rename header does not describe a non-replacing absolute rename");
-    require(std::ranges::equal(std::span{rename_bytes}.subspan(offsetof(FILE_RENAME_INFO, FileName)),
+    require(std::ranges::equal(std::span{rename_bytes}.subspan(offsetof(FILE_RENAME_INFO, FileName), filename_bytes),
                                std::as_bytes(std::span{archive_name.native()})),
             "The native rename filename bytes do not match their declared length");
+    require(std::ranges::all_of(std::span{rename_bytes}.last(sizeof(wchar_t)),
+                               [](const std::byte byte) { return byte == std::byte{}; }),
+            "The native rename filename is missing its trailing Unicode NUL");
     TemporaryDirectory fixture;
     const fs::path& directory = fixture.path();
     elevation::validate_path(directory / L"future.dat");

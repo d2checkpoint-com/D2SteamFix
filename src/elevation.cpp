@@ -301,10 +301,11 @@ std::vector<std::byte> rename_information(const fs::path& target) {
     std::wstring destination = target.native();
     if (destination.starts_with(L"\\\\?\\")) destination.erase(0, 4);
     constexpr std::size_t header_size = offsetof(FILE_RENAME_INFO, FileName);
-    if (destination.size() > (MAXDWORD - header_size) / sizeof(wchar_t)) fail(ERROR_BAD_PATHNAME);
+    constexpr std::size_t terminator_size = sizeof(wchar_t);
+    if (destination.size() > (MAXDWORD - header_size - terminator_size) / sizeof(wchar_t)) fail(ERROR_BAD_PATHNAME);
     const std::size_t name_bytes = destination.size() * sizeof(wchar_t);
     const DWORD length = static_cast<DWORD>(name_bytes);
-    std::vector<std::byte> storage(std::max(sizeof(FILE_RENAME_INFO), header_size + name_bytes));
+    std::vector<std::byte> storage(std::max(sizeof(FILE_RENAME_INFO), header_size + name_bytes + terminator_size));
     // Win32 uses zero for ReplaceIfExists=false and RootDirectory=nullptr.
     // Keep their entire native header, including union and alignment bytes,
     // zeroed instead of copying indeterminate C++ structure padding into it.
@@ -312,6 +313,8 @@ std::vector<std::byte> rename_information(const fs::path& target) {
                 &length, sizeof(length));
     std::ranges::copy(std::as_bytes(std::span{destination}),
                       std::span{storage}.subspan(header_size, name_bytes).begin());
+    // SetFileInformationByHandle also uses the trailing NUL when converting
+    // the absolute DOS path, although FileNameLength excludes that terminator.
     return storage;
 }
 

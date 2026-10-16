@@ -119,9 +119,16 @@ descriptors, and registry fixtures owned by the test. They cover:
   and temporary privilege restoration without requesting UAC.
 - Path and Steam-directory validation, process discovery and termination of
   fixture children, overlay-module identification, and repair helper behavior.
+- Recovery from finite process-observation failures while monitoring real
+  fixture children. This separate test target injects failures at specific API
+  call sites without changing the production application.
+- Real information/error dialogs and the built wrapper's invalid-invocation
+  entry point, with dialogs dismissed only in child processes owned by the test.
 
 Application tests replace dialogs with headless sinks; the real dialog code is
-retained in the coverage denominator. The suite does not launch Steam, change
-an installed game's permissions, request UAC, or perform a live Steam repair.
+also exercised by the separate UI test when a Windows desktop is available.
+That test reports a CTest skip (exit 77) if a desktop is unavailable before its
+initial UI check succeeds; subsequent failures fail the test. The suite does not
+launch Steam, change an installed game's permissions, request UAC, or perform a live Steam repair.
 See [AGENTS.md](../AGENTS.md) for the affected paths that still need manual
 Windows checks. Use the [README](../README.md) for installation and normal use.

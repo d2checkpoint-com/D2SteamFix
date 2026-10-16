@@ -109,6 +109,12 @@ if(BUILD_TESTING)
     steamfix_add_test(elevation_tests tests/elevation_tests.cpp src/command_line.cpp src/paths.cpp)
     steamfix_add_test(runtime_tests tests/runtime_tests.cpp
         src/command_line.cpp src/elevation.cpp src/logging.cpp src/ui.cpp)
+    steamfix_add_test(process_fault_tests tests/process_fault_tests.cpp
+        src/elevation.cpp src/logging.cpp src/paths.cpp src/command_line.cpp)
+    steamfix_add_test(ui_entry_tests tests/ui_entry_tests.cpp src/ui.cpp src/command_line.cpp
+        ARGS $<TARGET_FILE:steamfix>)
+    add_dependencies(ui_entry_tests steamfix)
+    set_tests_properties(ui_entry_tests PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
     add_library(overlay_fixture SHARED tests/overlay_fixture.cpp)
     set_target_properties(overlay_fixture PROPERTIES OUTPUT_NAME overlay_fixture PREFIX "")
     target_compile_features(overlay_fixture PRIVATE cxx_std_20)
