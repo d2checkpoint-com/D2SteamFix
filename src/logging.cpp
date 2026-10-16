@@ -15,23 +15,11 @@
 namespace fs = std::filesystem;
 
 namespace steamfix {
-namespace {
-constexpr std::uintmax_t max_log_size = 4U * 1024U * 1024U;
-
-void rotate(const fs::path& path) noexcept {
-    std::error_code error;
-    if (fs::file_size(path, error) <= max_log_size || error) return;
-    const fs::path old = path.parent_path() / (path.stem().native() + L".log.old");
-    fs::remove(old, error);
-    error.clear();
-    fs::rename(path, old, error);
-}
-} // namespace
 
 Logger::Logger(const fs::path& path) {
-    rotate(path);
+    elevation::rotate_log(path);
     file_ = elevation::open_file(path, FILE_APPEND_DATA | FILE_READ_ATTRIBUTES,
-                                  FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_ALWAYS,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_ALWAYS,
                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT);
     BY_HANDLE_FILE_INFORMATION information{};
     if (!GetFileInformationByHandle(file_.get(), &information)) {

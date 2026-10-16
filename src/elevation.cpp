@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 
@@ -30,7 +31,7 @@ constexpr DWORD file_limit = READ_CONTROL | WRITE_DAC | DELETE | FILE_READ_ATTRI
                              FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA |
                              FILE_WRITE_ATTRIBUTES | SYNCHRONIZE | GENERIC_READ | GENERIC_WRITE;
 constexpr DWORD terminate_access = PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
-enum class Operation : DWORD { open_file = 1, open_process = 2, move_state = 3 };
+enum class Operation : DWORD { open_file = 1, open_process = 2, move_state = 3, rotate_log = 4 };
 struct Request {
     DWORD magic = protocol;
     Operation operation{};
@@ -223,6 +224,12 @@ bool recovery(const fs::path& path) {
            regular(path.parent_path() / L"destiny2launcher.exe");
 }
 
+bool game_log(const fs::path& path) {
+    return paths::name_is(path, L"steamfix.log") &&
+           regular(path.parent_path() / L"destiny2.exe") &&
+           regular(path.parent_path() / L"destiny2launcher.exe");
+}
+
 void check_owner(const HANDLE file, PSID expected) {
     PSID owner = nullptr;
     PSECURITY_DESCRIPTOR descriptor = nullptr;
@@ -241,6 +248,44 @@ void check_regular_handle(const HANDLE file) {
     }
 }
 
+UniqueHandle checked_file(const fs::path& path, const DWORD access, const DWORD share,
+                           const DWORD creation, const DWORD flags, SECURITY_ATTRIBUTES* security = nullptr) {
+    HANDLE raw = CreateFileW(path.c_str(), access, share, security, creation, flags, nullptr);
+    if (raw == INVALID_HANDLE_VALUE) fail(GetLastError());
+    UniqueHandle file(raw);
+    check_regular_handle(file.get());
+    BY_HANDLE_FILE_INFORMATION information{};
+    if (!GetFileInformationByHandle(file.get(), &information)) fail(GetLastError());
+    if (information.nNumberOfLinks != 1) fail(ERROR_INVALID_DATA);
+    std::wstring final_path(32768, L'\0');
+    const DWORD final_length = GetFinalPathNameByHandleW(file.get(), final_path.data(),
+                                                        static_cast<DWORD>(final_path.size()), FILE_NAME_NORMALIZED);
+    if (final_length == 0 || final_length >= final_path.size()) fail(ERROR_BAD_PATHNAME);
+    final_path.resize(final_length);
+    std::wstring expected = path.native();
+    if (expected.starts_with(L"\\\\?\\")) expected.erase(0, 4);
+    if (final_path.starts_with(L"\\\\?\\")) final_path.erase(0, 4);
+    expected = fs::path(expected).lexically_normal().native();
+    final_path = fs::path(final_path).lexically_normal().native();
+    if (CompareStringOrdinal(expected.c_str(), static_cast<int>(expected.size()), final_path.c_str(),
+                             static_cast<int>(final_path.size()), TRUE) != CSTR_EQUAL) fail(ERROR_BAD_PATHNAME);
+    return file;
+}
+
+void rename_without_replacement(const HANDLE file, const fs::path& target) {
+    std::wstring destination = target.native();
+    if (destination.starts_with(L"\\\\?\\")) destination.erase(0, 4);
+    const size_t name_bytes = destination.size() * sizeof(wchar_t);
+    std::vector<std::byte> storage(offsetof(FILE_RENAME_INFO, FileName) + name_bytes);
+    auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
+    rename->ReplaceIfExists = FALSE;
+    rename->RootDirectory = nullptr;
+    rename->FileNameLength = static_cast<DWORD>(name_bytes);
+    std::memcpy(rename->FileName, destination.data(), name_bytes);
+    if (!SetFileInformationByHandle(file, FileRenameInfo, rename,
+                                    static_cast<DWORD>(storage.size()))) fail(GetLastError());
+}
+
 UniqueHandle privileged_file(const Request& request, const fs::path& path, PSID originator) {
     validate_path(path);
     if ((request.access & ~file_limit) != 0 ||
@@ -249,9 +294,7 @@ UniqueHandle privileged_file(const Request& request, const fs::path& path, PSID 
         fail(ERROR_ACCESS_DENIED);
     }
     const bool journal = recovery(path);
-    const bool log = paths::name_is(path, L"steamfix.log") &&
-                     regular(path.parent_path() / L"destiny2.exe") &&
-                     regular(path.parent_path() / L"destiny2launcher.exe");
+    const bool log = game_log(path);
     if (!journal && !log && !renderer(path)) fail(ERROR_ACCESS_DENIED);
     if (log && (request.creation != OPEN_ALWAYS ||
                 (request.access & ~(FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE)) != 0)) {
@@ -288,31 +331,64 @@ UniqueHandle privileged_file(const Request& request, const fs::path& path, PSID 
         enable_privilege(SE_RESTORE_NAME);
         extra_flags = FILE_FLAG_BACKUP_SEMANTICS;
     }
-    HANDLE raw = CreateFileW(path.c_str(), request.access | READ_CONTROL, request.share,
-                             descriptor == nullptr ? nullptr : &security, request.creation,
-                             request.flags | FILE_FLAG_OPEN_REPARSE_POINT | extra_flags, nullptr);
-    if (raw == INVALID_HANDLE_VALUE) fail(GetLastError());
-    UniqueHandle file(raw);
-    check_regular_handle(file.get());
-    BY_HANDLE_FILE_INFORMATION information{};
-    if (!GetFileInformationByHandle(file.get(), &information)) fail(GetLastError());
-    if (information.nNumberOfLinks != 1) fail(ERROR_ACCESS_DENIED);
-    std::wstring final_path(32768, L'\0');
-    const DWORD final_length = GetFinalPathNameByHandleW(file.get(), final_path.data(),
-                                                        static_cast<DWORD>(final_path.size()), FILE_NAME_NORMALIZED);
-    if (final_length == 0 || final_length >= final_path.size()) fail(ERROR_BAD_PATHNAME);
-    final_path.resize(final_length);
-    std::wstring expected = path.native();
-    if (expected.starts_with(L"\\\\?\\")) expected.erase(0, 4);
-    if (final_path.starts_with(L"\\\\?\\")) final_path.erase(0, 4);
-    expected = fs::path(expected).lexically_normal().native();
-    final_path = fs::path(final_path).lexically_normal().native();
-    if (CompareStringOrdinal(expected.c_str(), static_cast<int>(expected.size()), final_path.c_str(),
-                             static_cast<int>(final_path.size()), TRUE) != CSTR_EQUAL) fail(ERROR_ACCESS_DENIED);
+    UniqueHandle file = checked_file(path, request.access | READ_CONTROL, request.share,
+                                      request.creation, request.flags | FILE_FLAG_OPEN_REPARSE_POINT | extra_flags,
+                                      descriptor == nullptr ? nullptr : &security);
     const bool cleanup_only = request.creation == OPEN_EXISTING && (request.access & DELETE) != 0 &&
         (request.access & ~(DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES)) == 0;
     if (journal && !cleanup_only) check_owner(file.get(), originator);
     return file;
+}
+
+bool oversized_log(const HANDLE file) {
+    constexpr LONGLONG max_log_size = 4LL * 1024LL * 1024LL;
+    LARGE_INTEGER size{};
+    if (!GetFileSizeEx(file, &size)) fail(GetLastError());
+    return size.QuadPart > max_log_size;
+}
+
+bool rotate_existing_log(const fs::path& path, const bool privileged) {
+    std::optional<ScopedPrivilege> backup;
+    std::optional<ScopedPrivilege> restore;
+    DWORD flags = FILE_FLAG_OPEN_REPARSE_POINT;
+    if (privileged) {
+        validate_path(path);
+        if (!game_log(path)) fail(ERROR_ACCESS_DENIED);
+        backup.emplace(SE_BACKUP_NAME);
+        restore.emplace(SE_RESTORE_NAME);
+        flags |= FILE_FLAG_BACKUP_SEMANTICS;
+    }
+    // Avoid requesting DELETE access or UAC until a log actually needs rotation.
+    UniqueHandle observed = checked_file(path, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING, flags);
+    if (!oversized_log(observed.get())) return false;
+    observed.reset();
+    // Excluding delete sharing serializes concurrent rotations of this file.
+    UniqueHandle source = checked_file(path, DELETE | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, OPEN_EXISTING, flags);
+    if (!oversized_log(source.get())) return false;
+    for (std::uint64_t index = 0; index < std::numeric_limits<std::uint64_t>::max(); ++index) {
+        fs::path archive = path;
+        archive += index == 0 ? L".old" : L".old." + std::to_wstring(index);
+        try {
+            rename_without_replacement(source.get(), archive);
+            return true;
+        } catch (const std::system_error& error) {
+            const DWORD code = static_cast<DWORD>(error.code().value());
+            if (code == ERROR_ALREADY_EXISTS || code == ERROR_FILE_EXISTS) continue;
+            // Some Windows filesystems report access denied for an occupied
+            // destination. Never elevate just to replace an existing archive.
+            if ((code == ERROR_ACCESS_DENIED || code == ERROR_SHARING_VIOLATION) &&
+                GetFileAttributesW(archive.c_str()) != INVALID_FILE_ATTRIBUTES) continue;
+            throw;
+        }
+    }
+    fail(ERROR_TOO_MANY_NAMES);
+}
+
+bool rotation_deferred(const DWORD error) noexcept {
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ||
+           error == ERROR_SHARING_VIOLATION || error == ERROR_LOCK_VIOLATION;
 }
 
 UniqueHandle privileged_process(const DWORD pid) {
@@ -490,6 +566,12 @@ int helper(const DWORD parent_pid, const std::wstring& pipe_name) {
                 opened = privileged_file(request, path, user_sid(user));
             } else if (request.operation == Operation::open_process) {
                 opened = privileged_process(request.pid);
+            } else if (request.operation == Operation::rotate_log) {
+                try {
+                    response.handle = rotate_existing_log(path, true) ? 1 : 0;
+                } catch (const std::system_error& error) {
+                    if (!rotation_deferred(static_cast<DWORD>(error.code().value()))) throw;
+                }
             } else if (request.operation == Operation::move_state) {
                 validate_path(path);
                 validate_path(second);
@@ -505,17 +587,7 @@ int helper(const DWORD parent_pid, const std::wstring& pipe_name) {
                 check_owner(opened.get(), user_sid(user));
                 // Rename the validated source handle. Reopening by pathname
                 // would lose the private-journal access granted by backup semantics.
-                std::wstring destination = second.native();
-                if (destination.starts_with(L"\\\\?\\")) destination.erase(0, 4);
-                const size_t name_bytes = destination.size() * sizeof(wchar_t);
-                std::vector<std::byte> storage(offsetof(FILE_RENAME_INFO, FileName) + name_bytes);
-                auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
-                rename->ReplaceIfExists = FALSE;
-                rename->RootDirectory = nullptr;
-                rename->FileNameLength = static_cast<DWORD>(name_bytes);
-                std::memcpy(rename->FileName, destination.data(), name_bytes);
-                if (!SetFileInformationByHandle(opened.get(), FileRenameInfo, rename,
-                                                static_cast<DWORD>(storage.size()))) fail(GetLastError());
+                rename_without_replacement(opened.get(), second);
                 opened.reset();
             } else {
                 fail(ERROR_INVALID_DATA);
@@ -611,6 +683,29 @@ bool remove_recovery_file(const fs::path& path) {
     }
 }
 
+bool rotate_log(const fs::path& path) {
+    const fs::path absolute = fs::absolute(path);
+    if (!paths::name_is(absolute, L"steamfix.log")) fail(ERROR_ACCESS_DENIED);
+    try {
+        return rotate_existing_log(absolute, false);
+    } catch (const std::system_error& error) {
+        const DWORD code = static_cast<DWORD>(error.code().value());
+        if (rotation_deferred(code)) return false;
+        if (!permission_denied(code)) throw;
+    }
+    if (is_elevated()) {
+        try {
+            return rotate_existing_log(absolute, true);
+        } catch (const std::system_error& error) {
+            if (rotation_deferred(static_cast<DWORD>(error.code().value()))) return false;
+            throw;
+        }
+    }
+    Request request{};
+    request.operation = Operation::rotate_log;
+    return broker().request(request, absolute).handle != 0;
+}
+
 std::optional<int> dispatch_helper(const std::vector<std::wstring>& arguments) {
     if (arguments.empty() || arguments.front() != helper_switch) return std::nullopt;
     if (arguments.size() != 3) return ERROR_INVALID_PARAMETER;
@@ -677,7 +772,7 @@ std::optional<int> relaunch_as_administrator(const std::vector<std::wstring>& ar
     return static_cast<int>(status);
 }
 
-bool launch_as_desktop_user(const fs::path& executable, std::wstring& command_line,
+bool launch_as_desktop_user(const fs::path& executable, const std::wstring& command_line,
                             const fs::path& directory, PROCESS_INFORMATION& information) {
     if (!is_elevated()) return false;
     const HWND shell = GetShellWindow();
@@ -707,8 +802,18 @@ bool launch_as_desktop_user(const fs::path& executable, std::wstring& command_li
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
     startup.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
-    return CreateProcessWithTokenW(primary.get(), 0, executable.c_str(), command_line.data(), 0,
-                                   nullptr, directory.c_str(), &startup, &information) != FALSE;
+    // Both Windows process APIs may modify their command-line buffer even on
+    // failure. Keep the caller's original available for its fallback launch.
+    std::wstring mutable_command_line = command_line;
+    LPWCH raw_environment = GetEnvironmentStringsW();
+    if (raw_environment == nullptr) fail(GetLastError());
+    const std::unique_ptr<wchar_t, decltype(&FreeEnvironmentStringsW)> environment(
+        raw_environment, &FreeEnvironmentStringsW);
+    // Passing an explicit copy retains all of Steam's launch context while the
+    // process uses the desktop token. No environment values leave this process.
+    return CreateProcessWithTokenW(primary.get(), 0, executable.c_str(), mutable_command_line.data(),
+                                   CREATE_UNICODE_ENVIRONMENT, environment.get(), directory.c_str(),
+                                   &startup, &information) != FALSE;
 }
 
 } // namespace steamfix::elevation

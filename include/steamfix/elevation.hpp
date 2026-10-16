@@ -54,6 +54,9 @@ UniqueHandle open_process_for_termination(DWORD pid);
 void move_recovery_file(const std::filesystem::path& source,
                         const std::filesystem::path& destination);
 bool remove_recovery_file(const std::filesystem::path& path);
+// Archive oversized logs without replacing prior archives. A sharing lock may
+// defer rotation while a legacy logger still has the file open.
+bool rotate_log(const std::filesystem::path& path);
 
 // The broker dispatch must precede logging, the session mutex, and recovery.
 std::optional<int> dispatch_helper(const std::vector<std::wstring>& arguments);
@@ -61,7 +64,7 @@ std::optional<int> dispatch_helper(const std::vector<std::wstring>& arguments);
 // Use the interactive desktop user's token when an elevated wrapper starts a
 // child. Returns false if the desktop token is unavailable or no change is needed.
 bool launch_as_desktop_user(const std::filesystem::path& executable,
-                            std::wstring& command_line,
+                            const std::wstring& command_line,
                             const std::filesystem::path& directory,
                             PROCESS_INFORMATION& information);
 
