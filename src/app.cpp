@@ -103,7 +103,17 @@ fs::path current_directory() {
     return fs::path(buffer);
 }
 
-UniqueHandle session_mutex() {
+class SessionMutex final {
+public:
+    explicit SessionMutex(UniqueHandle handle) : handle_(std::move(handle)) {}
+    ~SessionMutex() { ReleaseMutex(handle_.get()); }
+    SessionMutex(const SessionMutex&) = delete;
+    SessionMutex& operator=(const SessionMutex&) = delete;
+private:
+    UniqueHandle handle_;
+};
+
+SessionMutex session_mutex() {
     SetLastError(ERROR_SUCCESS);
     HANDLE raw = CreateMutexW(nullptr, TRUE, L"Global\\D2SteamFix-1085660");
     if (raw == nullptr) {
@@ -115,7 +125,7 @@ UniqueHandle session_mutex() {
         throw AppError(ExitCode::existing_session, "single-instance check",
                        "another D2SteamFix session is already active on this computer");
     }
-    return handle;
+    return SessionMutex(std::move(handle));
 }
 
 
@@ -150,7 +160,7 @@ struct ChildProcess {
     DWORD pid;
 };
 
-ChildProcess launch(const Invocation& invocation, const Logger& log) {
+ChildProcess launch(const Invocation& invocation, const fs::path& steam_directory, const Logger& log) {
     std::wstring command_line;
     command_line::append_quoted(command_line, invocation.launcher.native());
     for (const std::wstring& argument : invocation.args) {
@@ -173,28 +183,13 @@ ChildProcess launch(const Invocation& invocation, const Logger& log) {
         if (error != ERROR_ELEVATION_REQUIRED && !elevation::permission_denied(error)) {
             throw AppError(ExitCode::process_creation, "launcher creation", windows_error(error));
         }
-        std::wstring parameters;
-        for (const std::wstring& argument : invocation.args) command_line::append_quoted(parameters, argument);
-        SHELLEXECUTEINFOW execute{};
-        execute.cbSize = sizeof(execute);
-        execute.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
-        execute.lpVerb = L"runas";
-        execute.lpFile = invocation.launcher.c_str();
-        execute.lpParameters = parameters.c_str();
-        execute.lpDirectory = invocation.game_dir.c_str();
-        execute.nShow = SW_SHOWNORMAL;
-        log.info("Windows denied launcher creation; requesting permission to start the validated launcher");
-        if (!ShellExecuteExW(&execute)) {
-            const DWORD elevated_error = GetLastError();
-            if (elevated_error == ERROR_CANCELLED) throw elevation::Cancelled();
-            throw AppError(ExitCode::process_creation, "launcher permission request", windows_error(elevated_error));
+        if (elevation::is_elevated()) {
+            throw AppError(ExitCode::process_creation, "launcher creation",
+                           "Windows still denied the launcher while D2SteamFix was running as administrator: " +
+                           windows_error(error));
         }
-        UniqueHandle process(execute.hProcess);
-        const DWORD pid = GetProcessId(process.get());
-        if (pid == 0) {
-            log.warn("elevated launcher started without a queryable PID; retaining its waitable process handle");
-        }
-        return {std::move(process), pid};
+        log.info("Windows denied launcher creation; restoring permissions before requesting an administrator launch");
+        throw elevation::RelaunchRequired(error, invocation.game_dir, invocation.launcher, steam_directory);
     }
     UniqueHandle process(information.hProcess);
     const UniqueHandle thread(information.hThread);
@@ -234,7 +229,11 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
 
     fs::path steam_directory;
     try {
-        steam_directory = steam::discover();
+        if (const std::optional<fs::path> inherited = elevation::inherited_steam_directory()) {
+            steam_directory = *inherited;
+        } else {
+            steam_directory = steam::discover();
+        }
     } catch (const std::exception& error) {
         throw AppError(ExitCode::steam_discovery, "Steam discovery", error.what());
     }
@@ -265,7 +264,7 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
     std::optional<int> exit_status;
     try {
         check_overlay();
-        ChildProcess child = launch(invocation, log);
+        ChildProcess child = launch(invocation, steam_directory, log);
         launcher_started = true;
         log.info("launched destiny2launcher.exe; beginning fail-closed process monitoring");
         exit_status = process::monitor(child.process.get(), child.pid, invocation.game_dir, log);
@@ -294,6 +293,8 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
         try {
             std::rethrow_exception(session_error);
         } catch (const elevation::Cancelled&) {
+            throw;
+        } catch (const elevation::RelaunchRequired&) {
             throw;
         } catch (AppError& error) {
             if (launcher_started) error.after_launch();
@@ -379,6 +380,7 @@ int entry() {
     try {
         forwarded = command_line_arguments();
         if (const std::optional<int> helper = elevation::dispatch_helper(forwarded)) return *helper;
+        elevation::accept_elevated_launch(forwarded);
     } catch (const std::exception& error) {
         ui::error(L"D2SteamFix could not read its command line: " + widen(error.what()));
         return static_cast<int>(ExitCode::invalid_invocation);
@@ -413,7 +415,7 @@ int entry() {
     log->info("startup; wrapper path: " + display_path(executable) +
               "; current working directory: " + display_path(cwd));
     try {
-        const UniqueHandle mutex = session_mutex();
+        const SessionMutex mutex = session_mutex();
         const fs::path recovery = acl::recovery_path(cwd);
         log->info("ACL recovery state path: " + display_path(recovery));
         std::error_code recovery_error;
@@ -443,6 +445,30 @@ int entry() {
         const int code = run(*log, forwarded, recovery);
         log->info("final exit status: " + std::to_string(code));
         return code;
+    } catch (const elevation::RelaunchRequired& request) {
+        // The protected session and its mutex have both unwound before UAC.
+        try {
+            log->info("original renderer permissions restored; requesting an administrator D2SteamFix session");
+            std::vector<std::wstring> retry = forwarded;
+            // Resolve a relative Steam command once, in its original directory.
+            retry.front() = request.launcher().native();
+            const std::optional<int> code = elevation::relaunch_as_administrator(retry, request.directory(),
+                                                                                     request.steam_directory());
+            if (code) {
+                log->info("administrator D2SteamFix session exit status: " + std::to_string(*code));
+            } else {
+                log->warn("administrator D2SteamFix session exited; Windows did not provide its exit status");
+            }
+            return code.value_or(0);
+        } catch (const elevation::Cancelled&) {
+            log->info("Windows permission request cancelled; original permissions remain restored");
+            return 0;
+        } catch (const std::exception& error) {
+            log->error("administrator session launch or monitoring failed: " + std::string(error.what()));
+            ui::error(L"D2SteamFix could not complete its administrator session.\n\n" + widen(error.what()) +
+                      L"\n\nOriginal renderer permissions were restored before the administrator session was requested.");
+            return static_cast<int>(ExitCode::process_creation);
+        }
     } catch (const elevation::Cancelled&) {
         log->info("Windows permission request cancelled; no launcher was started");
         return 0;

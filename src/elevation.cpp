@@ -22,6 +22,8 @@ namespace fs = std::filesystem;
 namespace steamfix::elevation {
 namespace {
 constexpr wchar_t helper_switch[] = L"--steamfix-permission-helper";
+constexpr wchar_t elevated_launch_switch[] = L"--steamfix-elevated-launch";
+std::optional<fs::path> accepted_steam_directory;
 constexpr DWORD protocol = 0x31584653;
 constexpr DWORD max_path_units = 32767;
 constexpr DWORD file_limit = READ_CONTROL | WRITE_DAC | DELETE | FILE_READ_ATTRIBUTES |
@@ -142,6 +144,44 @@ void enable_privilege(const wchar_t* name) {
     SetLastError(ERROR_SUCCESS);
     if (!AdjustTokenPrivileges(token.get(), FALSE, &privileges, 0, nullptr, nullptr) ||
         GetLastError() != ERROR_SUCCESS) fail(GetLastError());
+}
+
+class ScopedPrivilege final {
+public:
+    explicit ScopedPrivilege(const wchar_t* name) {
+        HANDLE raw = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &raw)) fail(GetLastError());
+        token_.reset(raw);
+        TOKEN_PRIVILEGES requested{};
+        requested.PrivilegeCount = 1;
+        if (!LookupPrivilegeValueW(nullptr, name, &requested.Privileges[0].Luid)) fail(GetLastError());
+        requested.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+        DWORD returned = 0;
+        SetLastError(ERROR_SUCCESS);
+        if (!AdjustTokenPrivileges(token_.get(), FALSE, &requested, sizeof(previous_), &previous_, &returned) ||
+            GetLastError() != ERROR_SUCCESS) fail(GetLastError());
+    }
+    ~ScopedPrivilege() {
+        const DWORD saved_error = GetLastError();
+        AdjustTokenPrivileges(token_.get(), FALSE, &previous_, 0, nullptr, nullptr);
+        SetLastError(saved_error);
+    }
+    ScopedPrivilege(const ScopedPrivilege&) = delete;
+    ScopedPrivilege& operator=(const ScopedPrivilege&) = delete;
+private:
+    UniqueHandle token_;
+    TOKEN_PRIVILEGES previous_{};
+};
+
+UniqueHandle process_with_debug_retry(const DWORD access, const DWORD pid) {
+    HANDLE raw = OpenProcess(access, FALSE, pid);
+    if (raw != nullptr) return UniqueHandle(raw);
+    const DWORD error = GetLastError();
+    if (!permission_denied(error)) fail(error);
+    const ScopedPrivilege privilege(SE_DEBUG_NAME);
+    raw = OpenProcess(access, FALSE, pid);
+    if (raw == nullptr) fail(GetLastError());
+    return UniqueHandle(raw);
 }
 
 bool regular(const fs::path& path) {
@@ -269,12 +309,14 @@ UniqueHandle privileged_file(const Request& request, const fs::path& path, PSID 
     final_path = fs::path(final_path).lexically_normal().native();
     if (CompareStringOrdinal(expected.c_str(), static_cast<int>(expected.size()), final_path.c_str(),
                              static_cast<int>(final_path.size()), TRUE) != CSTR_EQUAL) fail(ERROR_ACCESS_DENIED);
-    if (journal) check_owner(file.get(), originator);
+    const bool cleanup_only = request.creation == OPEN_EXISTING && (request.access & DELETE) != 0 &&
+        (request.access & ~(DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES)) == 0;
+    if (journal && !cleanup_only) check_owner(file.get(), originator);
     return file;
 }
 
 UniqueHandle privileged_process(const DWORD pid) {
-    UniqueHandle process(OpenProcess(terminate_access, FALSE, pid));
+    UniqueHandle process = process_with_debug_retry(terminate_access, pid);
     const fs::path image = executable_path(process.get());
     validate_path(image);
     const bool destiny = paths::name_is(image, L"destiny2.exe") ||
@@ -422,12 +464,7 @@ int helper(const DWORD parent_pid, const std::wstring& pipe_name) {
     if (!is_elevated() || !pipe_name.starts_with(L"\\\\.\\pipe\\D2SteamFix-") ||
         pipe_name.size() > 100 || parent_pid == 0) return ERROR_ACCESS_DENIED;
     constexpr DWORD parent_access = PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE;
-    HANDLE parent_raw = OpenProcess(parent_access, FALSE, parent_pid);
-    if (parent_raw == nullptr && permission_denied(GetLastError())) {
-        enable_privilege(SE_DEBUG_NAME);
-        parent_raw = OpenProcess(parent_access, FALSE, parent_pid);
-    }
-    UniqueHandle parent(parent_raw);
+    UniqueHandle parent = process_with_debug_retry(parent_access, parent_pid);
     if (!paths::equal_windows(executable_path(parent.get()), executable_path())) return ERROR_ACCESS_DENIED;
     std::vector<std::byte> user = token_user(parent.get());
     UniqueHandle pipe(CreateFileW(pipe_name.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr,
@@ -465,6 +502,7 @@ int helper(const DWORD parent_pid, const std::wstring& pipe_name) {
                 check.share = FILE_SHARE_READ | FILE_SHARE_WRITE;
                 check.creation = OPEN_EXISTING;
                 opened = privileged_file(check, path, user_sid(user));
+                check_owner(opened.get(), user_sid(user));
                 // Rename the validated source handle. Reopening by pathname
                 // would lose the private-journal access granted by backup semantics.
                 std::wstring destination = second.native();
@@ -523,13 +561,17 @@ UniqueHandle open_file(const fs::path& path, const DWORD access, const DWORD sha
     HANDLE raw = CreateFileW(path.c_str(), access, share, security, creation, flags, nullptr);
     if (raw != INVALID_HANDLE_VALUE) return UniqueHandle(raw);
     const DWORD error = GetLastError();
-    if (!permission_denied(error) || is_elevated()) fail(error);
+    if (!permission_denied(error)) fail(error);
     Request request{};
     request.operation = Operation::open_file;
     request.access = access;
     request.share = share;
     request.creation = creation;
     request.flags = flags;
+    if (is_elevated()) {
+        std::vector<std::byte> user = token_user(GetCurrentProcess());
+        return privileged_file(request, fs::absolute(path), user_sid(user));
+    }
     return UniqueHandle(reinterpret_cast<HANDLE>(broker().request(request, fs::absolute(path)).handle));
 }
 
@@ -537,7 +579,8 @@ UniqueHandle open_process_for_termination(const DWORD pid) {
     HANDLE raw = OpenProcess(terminate_access, FALSE, pid);
     if (raw != nullptr) return UniqueHandle(raw);
     const DWORD error = GetLastError();
-    if (!permission_denied(error) || is_elevated()) fail(error);
+    if (!permission_denied(error)) fail(error);
+    if (is_elevated()) return privileged_process(pid);
     Request request{};
     request.operation = Operation::open_process;
     request.pid = pid;
@@ -581,6 +624,57 @@ std::optional<int> dispatch_helper(const std::vector<std::wstring>& arguments) {
     } catch (...) {
         return ERROR_GEN_FAILURE;
     }
+}
+
+void accept_elevated_launch(std::vector<std::wstring>& arguments) {
+    if (arguments.empty() || arguments.front() != elevated_launch_switch) return;
+    if (arguments.size() < 4 || !is_elevated()) fail(ERROR_INVALID_PARAMETER);
+    size_t consumed = 0;
+    const unsigned long long value = std::stoull(arguments[1], &consumed);
+    if (consumed != arguments[1].size() || value == 0 || value > MAXDWORD ||
+        value == GetCurrentProcessId()) fail(ERROR_INVALID_PARAMETER);
+    const UniqueHandle parent = process_with_debug_retry(PROCESS_QUERY_LIMITED_INFORMATION,
+                                                         static_cast<DWORD>(value));
+    if (!paths::equal_windows(executable_path(parent.get()), executable_path())) fail(ERROR_ACCESS_DENIED);
+    const fs::path steam_directory = fs::canonical(fs::path(arguments[2]));
+    if (!regular(steam_directory / L"steam.exe")) fail(ERROR_FILE_NOT_FOUND);
+    // Steam's registry and environment may belong to the original account.
+    // Only this authenticated private handoff can supply a discovery override.
+    accepted_steam_directory = steam_directory;
+    // The complete forwarded command is independently validated by normal entry.
+    if (!SetEnvironmentVariableW(L"SteamAppId", L"1085660") ||
+        !SetEnvironmentVariableW(L"SteamGameId", L"1085660")) fail(GetLastError());
+    arguments.erase(arguments.begin(), arguments.begin() + 3);
+}
+
+std::optional<fs::path> inherited_steam_directory() {
+    return accepted_steam_directory;
+}
+
+std::optional<int> relaunch_as_administrator(const std::vector<std::wstring>& arguments,
+                                            const fs::path& directory, const fs::path& steam_directory) {
+    if (arguments.empty() || is_elevated()) fail(ERROR_INVALID_PARAMETER);
+    const fs::path executable = executable_path();
+    std::wstring parameters;
+    command_line::append_quoted(parameters, elevated_launch_switch);
+    command_line::append_quoted(parameters, std::to_wstring(GetCurrentProcessId()));
+    command_line::append_quoted(parameters, steam_directory.native());
+    for (const std::wstring& argument : arguments) command_line::append_quoted(parameters, argument);
+    SHELLEXECUTEINFOW execute{};
+    execute.cbSize = sizeof(execute);
+    execute.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
+    execute.lpVerb = L"runas";
+    execute.lpFile = executable.c_str();
+    execute.lpParameters = parameters.c_str();
+    execute.lpDirectory = directory.c_str();
+    execute.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&execute)) fail(GetLastError());
+    const UniqueHandle child(execute.hProcess);
+    const DWORD waited = WaitForSingleObject(child.get(), INFINITE);
+    if (waited != WAIT_OBJECT_0) fail(GetLastError());
+    DWORD status = 0;
+    if (!GetExitCodeProcess(child.get(), &status)) return std::nullopt;
+    return static_cast<int>(status);
 }
 
 bool launch_as_desktop_user(const fs::path& executable, std::wstring& command_line,
