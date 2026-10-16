@@ -6,7 +6,6 @@
 #include <optional>
 #include <system_error>
 #include <utility>
-#include <utility>
 #include <vector>
 
 namespace steamfix::elevation {

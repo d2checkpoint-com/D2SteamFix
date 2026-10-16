@@ -1026,12 +1026,14 @@ void Protection::restore(const Logger& log) {
     } catch (const std::exception& error) {
         throw protection_error("ACL restoration", error);
     }
+    // Permission restoration is complete even if journal cleanup is declined.
+    // Do not repeat a cancelled elevation prompt from the destructor.
+    state_ = State::restored;
     try {
         elevation::remove_recovery_file(state_path_);
     } catch (const std::exception& error) {
         throw protection_error("ACL recovery cleanup", error);
     }
-    state_ = State::restored;
     log.info("restored original renderer permissions and removed recovery state");
 }
 
