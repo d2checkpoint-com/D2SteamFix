@@ -1,4 +1,6 @@
 /build/
+/build-analysis/
+/build-coverage/
 /.vs/
 /out/
 *.log

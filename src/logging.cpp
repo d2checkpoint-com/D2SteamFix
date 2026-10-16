@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iomanip>
+#include <span>
 #include <sstream>
 #include <string>
 #include <system_error>
@@ -39,7 +40,6 @@ void Logger::write(const std::string_view severity, const std::string_view messa
     try {
         SYSTEMTIME now{};
         GetSystemTime(&now);
-        std::lock_guard lock(mutex_);
         std::ostringstream output;
         size_t start = 0;
         do {
@@ -56,15 +56,18 @@ void Logger::write(const std::string_view severity, const std::string_view messa
             start = end + 1;
         } while (start <= message.size());
         const std::string data = output.str();
-        size_t offset = 0;
-        while (offset < data.size()) {
-            const DWORD requested = static_cast<DWORD>(std::min<size_t>(data.size() - offset, MAXDWORD));
+        auto remaining = std::as_bytes(std::span{data});
+        // Formatting can allocate; only serialize the writes to this file.
+        std::lock_guard lock(mutex_);
+        while (!remaining.empty()) {
+            const DWORD requested = static_cast<DWORD>(std::min<std::size_t>(remaining.size(), MAXDWORD));
             DWORD written = 0;
-            if (!WriteFile(file_.get(), data.data() + offset, requested, &written, nullptr) || written == 0) {
+            if (!WriteFile(file_.get(), remaining.data(), requested, &written, nullptr) || written == 0 ||
+                written > requested) {
                 OutputDebugStringW(L"D2SteamFix: writing steamfix.log failed.\n");
                 return;
             }
-            offset += written;
+            remaining = remaining.subspan(written);
         }
     } catch (...) {
         OutputDebugStringW(L"D2SteamFix: writing steamfix.log failed.\n");

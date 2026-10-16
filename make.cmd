@@ -18,6 +18,9 @@ goto dispatch
 if /i "%task%"=="configure" goto configure
 if /i "%task%"=="build" goto build
 if /i "%task%"=="debug" goto debug
+if /i "%task%"=="test" goto test
+if /i "%task%"=="analyze" goto analyze
+if /i "%task%"=="coverage" goto coverage
 if /i "%task%"=="clean" goto clean
 if /i "%task%"=="help" goto help
 if /i "%task%"=="--help" goto help
@@ -40,9 +43,29 @@ call :do_configure || goto failure
 call :do_build Debug || goto failure
 goto success
 
+:test
+call :do_configure || goto failure
+call :do_build Debug || goto failure
+ctest --test-dir build -C Debug --output-on-failure --no-tests=error
+if errorlevel 1 goto failure
+goto success
+
+:analyze
+cmake -S . -B build-analysis -A x64 -DSTEAMFIX_ENABLE_CODE_ANALYSIS=ON
+if errorlevel 1 goto failure
+cmake --build build-analysis --config Debug --parallel
+if errorlevel 1 goto failure
+ctest --test-dir build-analysis -C Debug --output-on-failure --no-tests=error
+if errorlevel 1 goto failure
+goto success
+
 :clean
 echo Removing build artifacts...
 cmake -E remove_directory "%CD%\build"
+if errorlevel 1 goto failure
+cmake -E remove_directory "%CD%\build-analysis"
+if errorlevel 1 goto failure
+cmake -E remove_directory "%CD%\build-coverage"
 if errorlevel 1 goto failure
 echo Runtime logs and the game-directory recovery journal are intentionally preserved.
 goto success
@@ -55,13 +78,25 @@ echo Tasks:
 echo   configure  Generate a 64-bit Visual Studio build tree
 echo   build      Build the release executable
 echo   debug      Build the debug executable
-echo   clean      Remove the build directory only
+echo   test       Build and run the debug regression tests
+echo   analyze    Build with C++ Core Check and run regression tests
+echo   coverage   Measure Debug production line coverage with OpenCppCoverage
+echo   clean      Remove build, analysis, and coverage directories
 echo   help       Show this help
 echo.
 if defined help_exit (
     popd
     exit /b %help_exit%
 )
+goto success
+
+:coverage
+cmake -S . -B build-coverage -A x64 -DSTEAMFIX_ENABLE_COVERAGE=ON
+if errorlevel 1 goto failure
+cmake --build build-coverage --config Debug --parallel
+if errorlevel 1 goto failure
+powershell -NoProfile -ExecutionPolicy Bypass -File cmake\RunCoverage.ps1 -BuildDirectory build-coverage
+if errorlevel 1 goto failure
 goto success
 
 :do_configure

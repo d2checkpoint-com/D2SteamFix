@@ -19,10 +19,14 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <cwchar>
+#include <exception>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -44,17 +48,19 @@ bool missing(const DWORD error) noexcept {
 
 class MutexLock {
 public:
-    MutexLock(const wchar_t* name, const DWORD timeout) {
-        handle_ = UniqueHandle(CreateMutexW(nullptr, FALSE, name));
+    MutexLock(const wchar_t* name, const DWORD timeout)
+        : handle_(CreateMutexW(nullptr, FALSE, name)) {
         const DWORD result = WaitForSingleObject(handle_.get(), timeout);
         if (result == WAIT_TIMEOUT) {
             throw std::runtime_error("another D2SteamFix session did not finish; close it and retry repair");
         }
         if (result != WAIT_OBJECT_0 && result != WAIT_ABANDONED) throw_win32(GetLastError());
     }
-    ~MutexLock() { ReleaseMutex(handle_.get()); }
+    ~MutexLock() noexcept { ReleaseMutex(handle_.get()); }
     MutexLock(const MutexLock&) = delete;
     MutexLock& operator=(const MutexLock&) = delete;
+    MutexLock(MutexLock&&) = delete;
+    MutexLock& operator=(MutexLock&&) = delete;
 private:
     UniqueHandle handle_;
 };
@@ -99,14 +105,23 @@ std::vector<std::byte> token_user(const HANDLE token) {
     if (!GetTokenInformation(token, TokenUser, result.data(), needed, &needed)) {
         throw_win32(GetLastError());
     }
+    if (needed < sizeof(TOKEN_USER) || needed > result.size()) {
+        throw std::runtime_error("Windows returned an invalid token-user information size");
+    }
     return result;
 }
 
 bool same_user(const HANDLE first, const HANDLE second) {
     const std::vector<std::byte> a = token_user(first);
     const std::vector<std::byte> b = token_user(second);
-    return EqualSid(reinterpret_cast<const TOKEN_USER*>(a.data())->User.Sid,
-                    reinterpret_cast<const TOKEN_USER*>(b.data())->User.Sid) != FALSE;
+    // TokenUser is a variable-length Win32 record. Copy its trivially copyable
+    // header instead of treating byte storage as an aligned TOKEN_USER object.
+    static_assert(std::is_trivially_copyable_v<TOKEN_USER>);
+    TOKEN_USER first_user{};
+    TOKEN_USER second_user{};
+    std::memcpy(&first_user, a.data(), sizeof(first_user));
+    std::memcpy(&second_user, b.data(), sizeof(second_user));
+    return EqualSid(first_user.User.Sid, second_user.User.Sid) != FALSE;
 }
 
 bool access_allowed(const HANDLE file, const HANDLE token, const DWORD access) {
@@ -115,32 +130,43 @@ bool access_allowed(const HANDLE file, const HANDLE token, const DWORD access) {
         OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
         nullptr, nullptr, nullptr, nullptr, &descriptor);
     if (status != ERROR_SUCCESS) throw_win32(status);
-    LocalMemory memory(descriptor);
+    const LocalMemory memory(descriptor);
     HANDLE raw = nullptr;
     if (!DuplicateToken(token, SecurityImpersonation, &raw)) throw_win32(GetLastError());
     const UniqueHandle impersonation(raw);
     GENERIC_MAPPING mapping{FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_GENERIC_EXECUTE, FILE_ALL_ACCESS};
-    std::vector<std::byte> privileges(sizeof(PRIVILEGE_SET) + 32U * sizeof(LUID_AND_ATTRIBUTES));
-    DWORD length = static_cast<DWORD>(privileges.size());
+    // AccessCheck uses a C record with a one-element trailing array. Keep the
+    // header typed and provide adjacent, aligned storage for its extra entries.
+    struct PrivilegeBuffer {
+        PRIVILEGE_SET header{};
+        std::array<LUID_AND_ATTRIBUTES, 32> additional{};
+    };
+    static_assert(std::is_standard_layout_v<PrivilegeBuffer>);
+    static_assert(offsetof(PrivilegeBuffer, additional) == sizeof(PRIVILEGE_SET));
+    static_assert(sizeof(PrivilegeBuffer) == sizeof(PRIVILEGE_SET) +
+                                              32 * sizeof(LUID_AND_ATTRIBUTES));
+    PrivilegeBuffer privileges{};
+    DWORD length = sizeof(privileges);
     DWORD granted = 0;
     BOOL allowed = FALSE;
     if (!AccessCheck(descriptor, impersonation.get(), access, &mapping,
-                      reinterpret_cast<PPRIVILEGE_SET>(privileges.data()), &length, &granted, &allowed)) {
+                      &privileges.header, &length, &granted, &allowed)) {
         throw_win32(GetLastError());
     }
     return allowed != FALSE;
 }
 
 bool confirm() {
-    const TASKDIALOG_BUTTON buttons[]{{IDOK, L"Continue"}, {IDCANCEL, L"Cancel"}};
+    constexpr std::array<TASKDIALOG_BUTTON, 2> buttons{{
+        {IDOK, L"Continue"}, {IDCANCEL, L"Cancel"}}};
     TASKDIALOGCONFIG dialog{};
     dialog.cbSize = sizeof(dialog);
     dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
     dialog.pszWindowTitle = L"D2SteamFix";
     dialog.pszMainIcon = TD_INFORMATION_ICON;
     dialog.pszMainInstruction = L"Steam and Destiny 2 will close so Steam can repair its files.";
-    dialog.cButtons = static_cast<UINT>(std::size(buttons));
-    dialog.pButtons = buttons;
+    dialog.cButtons = static_cast<UINT>(buttons.size());
+    dialog.pButtons = buttons.data();
     dialog.nDefaultButton = IDCANCEL;
     int selected = IDCANCEL;
     const HRESULT result = TaskDialogIndirect(&dialog, &selected, nullptr, nullptr);
@@ -208,7 +234,7 @@ bool inside_steam(const fs::path& image, const fs::path& directory) {
     // Steam's client helpers live in child directories, never in steamapps.
     // Updating Steam may already have renamed or replaced a running image.
     fs::path parent = fs::weakly_canonical(image.parent_path());
-    for (unsigned depth = 0; depth < 8; ++depth) {
+    for (int depth = 0; depth < 8; ++depth) {
         if (paths::equal_windows(parent, directory)) return true;
         if (paths::name_is(parent, L"steamapps")) return false;
         const fs::path next = parent.parent_path();
@@ -234,7 +260,7 @@ bool steam_process(const fs::path& image, const fs::path& selected_directory) {
     // Close Steam clients from other installations too, as repair promises to
     // close Steam before replacing files. Verify the installation by its client.
     fs::path parent = fs::weakly_canonical(image.parent_path());
-    for (unsigned depth = 0; depth < 8; ++depth) {
+    for (int depth = 0; depth < 8; ++depth) {
         if (paths::name_is(parent, L"steamapps")) return false;
         const DWORD attributes = GetFileAttributesW((parent / L"steam.exe").c_str());
         if (attributes != INVALID_FILE_ATTRIBUTES &&
@@ -271,12 +297,22 @@ struct Termination {
     Candidate candidate;
 };
 
+DWORD wait_for_process(const HANDLE process, const DWORD timeout) {
+    const DWORD result = WaitForSingleObject(process, timeout);
+    if (result == WAIT_FAILED) throw_win32(GetLastError());
+    if (result != WAIT_OBJECT_0 && result != WAIT_TIMEOUT) {
+        throw std::runtime_error("waiting for a repair process returned unexpected status " +
+                                 std::to_string(result));
+    }
+    return result;
+}
+
 std::vector<Termination> prepare_shutdown(const fs::path& steam_directory) {
     std::vector<Termination> result;
     for (const Candidate& candidate : candidates()) {
         try {
             UniqueHandle handle = elevation::open_process_for_termination(candidate.pid);
-            if (WaitForSingleObject(handle.get(), 0) == WAIT_OBJECT_0) continue;
+            if (wait_for_process(handle.get(), 0) == WAIT_OBJECT_0) continue;
             const fs::path image = process::image_path(handle.get());
             if (!paths::name_is(image, candidate.name)) continue;
             if (!destiny_name(candidate.name) && !steam_process(image, steam_directory)) continue;
@@ -292,19 +328,18 @@ std::vector<Termination> prepare_shutdown(const fs::path& steam_directory) {
 void shutdown(const fs::path& steam_directory, const Logger& log) {
     // Prepare every handle before terminating anything, so UAC cancellation is harmless.
     std::vector<Termination> targets = prepare_shutdown(steam_directory);
-    for (unsigned pass = 0; pass < 8; ++pass) {
+    for (int pass = 0; pass < 8; ++pass) {
         // Stop the game before Steam, including processes created while Steam was closing.
         for (const bool destiny : {true, false}) {
             for (const Termination& target : targets) {
                 if (destiny_name(target.candidate.name) != destiny) continue;
-                if (WaitForSingleObject(target.process.get(), 0) == WAIT_OBJECT_0) continue;
+                if (wait_for_process(target.process.get(), 0) == WAIT_OBJECT_0) continue;
                 if (!TerminateProcess(target.process.get(), ERROR_CANCELLED)) {
                     const DWORD error = GetLastError();
                     if (WaitForSingleObject(target.process.get(), 0) != WAIT_OBJECT_0) throw_win32(error);
                 }
-                const DWORD waited = WaitForSingleObject(target.process.get(), 10000);
+                const DWORD waited = wait_for_process(target.process.get(), 10000);
                 if (waited != WAIT_OBJECT_0) {
-                    if (waited == WAIT_FAILED) throw_win32(GetLastError());
                     throw std::runtime_error("a Steam or Destiny process did not exit during repair");
                 }
                 log.info("Steam repair closed " + narrow(target.candidate.name) +
@@ -393,8 +428,7 @@ void wait_for_repair(const HANDLE child, const fs::path& directory, const Logger
     const auto deadline = Clock::now() + std::chrono::minutes(20);
     std::optional<Clock::time_point> quiet_since;
     for (;;) {
-        const DWORD wait = WaitForSingleObject(child, 500);
-        if (wait != WAIT_TIMEOUT && wait != WAIT_OBJECT_0) throw_win32(GetLastError());
+        const DWORD wait = wait_for_process(child, 500);
         if (wait == WAIT_OBJECT_0 && !steam_client_alive(directory)) {
             const auto now = Clock::now();
             if (!quiet_since) quiet_since = now;

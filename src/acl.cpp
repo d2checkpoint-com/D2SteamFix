@@ -21,6 +21,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <type_traits>
 #include <utility>
 
 namespace fs = std::filesystem;
@@ -57,31 +58,71 @@ void require_range(const std::span<const std::byte> data, const size_t offset,
 }
 
 template <typename T>
+    requires std::is_trivially_copyable_v<T>
 T object_at(const std::span<const std::byte> data, const size_t offset, const char* message) {
     require_range(data, offset, sizeof(T), message);
     T result{};
-    std::memcpy(&result, data.data() + offset, sizeof(result));
+    std::memcpy(&result, data.subspan(offset, sizeof(T)).data(), sizeof(result));
     return result;
 }
 
-void validate_relative_sid(const std::span<const std::byte> data, const DWORD relative_offset) {
+// These Win32 input parameters predate const-correct interfaces. Only pass the
+// resulting pointer to APIs that document the pointed-to storage as input.
+void* win32_input(const void* data) noexcept {
+    return const_cast<void*>(data);
+}
+
+PSID sid_from_bytes(const std::span<const std::byte> data) {
     constexpr size_t sid_header_size = offsetof(SID, SubAuthority);
-    const size_t offset = relative_offset;
-    if (offset < sizeof(SECURITY_DESCRIPTOR_RELATIVE) || offset % alignof(DWORD) != 0) {
-        throw std::runtime_error("invalid security descriptor SID offset");
-    }
-    require_range(data, offset, sid_header_size, "truncated security descriptor SID");
-    const auto revision = std::to_integer<std::uint8_t>(data[offset]);
-    const auto count = std::to_integer<std::uint8_t>(data[offset + 1]);
+    require_range(data, 0, sid_header_size, "truncated security descriptor SID");
+    const auto revision = std::to_integer<std::uint8_t>(data[0]);
+    const auto count = std::to_integer<std::uint8_t>(data[1]);
     if (revision != SID_REVISION || count > SID_MAX_SUB_AUTHORITIES) {
         throw std::runtime_error("invalid security descriptor SID");
     }
     const size_t length = checked_add(sid_header_size, static_cast<size_t>(count) * sizeof(DWORD));
-    require_range(data, offset, length, "truncated security descriptor SID");
-    const auto sid = reinterpret_cast<PSID>(const_cast<std::byte*>(data.data() + offset));
+    require_range(data, 0, length, "truncated security descriptor SID");
+    const auto sid = win32_input(data.data());
     if (!IsValidSid(sid) || GetLengthSid(sid) != length) {
         throw std::runtime_error("invalid security descriptor SID");
     }
+    return sid;
+}
+
+void validate_relative_sid(const std::span<const std::byte> data, const DWORD relative_offset) {
+    const size_t offset = relative_offset;
+    if (offset < sizeof(SECURITY_DESCRIPTOR_RELATIVE) || offset % alignof(DWORD) != 0) {
+        throw std::runtime_error("invalid security descriptor SID offset");
+    }
+    require_range(data, offset, 0, "truncated security descriptor SID");
+    static_cast<void>(sid_from_bytes(data.subspan(offset)));
+}
+
+void validate_acl(const std::span<const std::byte> data) {
+    const ACL acl = object_at<ACL>(data, 0, "truncated security descriptor ACL");
+    if (acl.AclSize < sizeof(ACL)) throw std::runtime_error("invalid security descriptor ACL size");
+    require_range(data, 0, acl.AclSize, "truncated security descriptor ACL");
+    const auto acl_bytes = data.first(acl.AclSize);
+
+    size_t ace_offset = sizeof(ACL);
+    for (WORD index = 0; index < acl.AceCount; ++index) {
+        const ACE_HEADER header =
+            object_at<ACE_HEADER>(acl_bytes, ace_offset, "truncated security descriptor ACE");
+        if (header.AceSize < sizeof(ACE_HEADER) || header.AceSize % alignof(DWORD) != 0) {
+            throw std::runtime_error("invalid security descriptor ACE size");
+        }
+        require_range(acl_bytes, ace_offset, header.AceSize, "truncated security descriptor ACE");
+        if (header.AceType == ACCESS_DENIED_ACE_TYPE || header.AceType == ACCESS_ALLOWED_ACE_TYPE) {
+            constexpr size_t sid_offset = offsetof(ACCESS_DENIED_ACE, SidStart);
+            if (header.AceSize < sid_offset) throw std::runtime_error("truncated security descriptor ACE");
+            static_cast<void>(sid_from_bytes(
+                acl_bytes.subspan(ace_offset + sid_offset, header.AceSize - sid_offset)));
+        }
+        ace_offset = checked_add(ace_offset, header.AceSize);
+    }
+
+    const auto acl_pointer = static_cast<PACL>(win32_input(data.data()));
+    if (!IsValidAcl(acl_pointer)) throw std::runtime_error("invalid security descriptor ACL");
 }
 
 void validate_relative_acl(const std::span<const std::byte> data, const DWORD relative_offset) {
@@ -89,24 +130,8 @@ void validate_relative_acl(const std::span<const std::byte> data, const DWORD re
     if (offset < sizeof(SECURITY_DESCRIPTOR_RELATIVE) || offset % alignof(DWORD) != 0) {
         throw std::runtime_error("invalid security descriptor ACL offset");
     }
-    const ACL acl = object_at<ACL>(data, offset, "truncated security descriptor ACL");
-    if (acl.AclSize < sizeof(ACL)) throw std::runtime_error("invalid security descriptor ACL size");
-    const size_t end = checked_add(offset, acl.AclSize);
-    if (end > data.size()) throw std::runtime_error("truncated security descriptor ACL");
-
-    size_t ace_offset = checked_add(offset, sizeof(ACL));
-    for (WORD index = 0; index < acl.AceCount; ++index) {
-        const ACE_HEADER header =
-            object_at<ACE_HEADER>(data, ace_offset, "truncated security descriptor ACE");
-        if (header.AceSize < sizeof(ACE_HEADER)) {
-            throw std::runtime_error("invalid security descriptor ACE size");
-        }
-        ace_offset = checked_add(ace_offset, header.AceSize);
-        if (ace_offset > end) throw std::runtime_error("truncated security descriptor ACE");
-    }
-
-    const auto acl_pointer = reinterpret_cast<PACL>(const_cast<std::byte*>(data.data() + offset));
-    if (!IsValidAcl(acl_pointer)) throw std::runtime_error("invalid security descriptor ACL");
+    require_range(data, offset, 0, "truncated security descriptor ACL");
+    validate_acl(data.subspan(offset));
 }
 
 void validate_relative_descriptor(const std::span<const std::byte> bytes) {
@@ -130,8 +155,7 @@ void validate_relative_descriptor(const std::span<const std::byte> bytes) {
         throw std::runtime_error("security descriptor has an unexpected DACL offset");
     }
 
-    const auto raw = reinterpret_cast<PSECURITY_DESCRIPTOR>(
-        const_cast<std::byte*>(bytes.data()));
+    const auto raw = win32_input(bytes.data());
     if (!IsValidSecurityDescriptor(raw) || GetSecurityDescriptorLength(raw) != bytes.size()) {
         throw std::runtime_error("invalid security descriptor");
     }
@@ -145,8 +169,7 @@ struct DescriptorParts {
 
 DescriptorParts descriptor_parts(const std::span<const std::byte> bytes) {
     validate_relative_descriptor(bytes);
-    const auto descriptor = reinterpret_cast<PSECURITY_DESCRIPTOR>(
-        const_cast<std::byte*>(bytes.data()));
+    const auto descriptor = win32_input(bytes.data());
     BOOL present = FALSE;
     BOOL defaulted = FALSE;
     PACL dacl = nullptr;
@@ -171,8 +194,8 @@ PACL acl_from_bytes(const std::span<const std::byte> bytes) {
     }
     const ACL header = object_at<ACL>(bytes, 0, "truncated protected ACL");
     if (header.AclSize != bytes.size()) throw std::runtime_error("invalid protected ACL length");
-    auto* acl = reinterpret_cast<PACL>(const_cast<std::byte*>(bytes.data()));
-    if (!IsValidAcl(acl)) throw std::runtime_error("invalid protected ACL");
+    validate_acl(bytes);
+    auto* acl = static_cast<PACL>(win32_input(bytes.data()));
     return acl;
 }
 
@@ -283,34 +306,49 @@ OpenBackup make_backup(const fs::path& path) {
     return {std::move(backup), std::move(opened.handle), opened.identity};
 }
 
-struct UserIdentity {
-    UniqueHandle token;
-    std::vector<std::byte> data;
-    PSID sid = nullptr;
+class UserIdentity final {
+public:
+    explicit UserIdentity(const std::span<const std::byte> sid)
+        : data_(sid.begin(), sid.end()) {
+        static_cast<void>(sid_from_bytes(data_));
+    }
+
+    [[nodiscard]] PSID sid() noexcept { return data_.data(); }
+
+private:
+    std::vector<std::byte> data_;
 };
 
 UserIdentity current_user() {
     HANDLE raw = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) throw_win32(GetLastError());
-    UserIdentity result{UniqueHandle(raw), {}, nullptr};
+    UniqueHandle token(raw);
     DWORD needed = 0;
     SetLastError(ERROR_SUCCESS);
-    static_cast<void>(GetTokenInformation(result.token.get(), TokenUser, nullptr, 0, &needed));
+    static_cast<void>(GetTokenInformation(token.get(), TokenUser, nullptr, 0, &needed));
     if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || needed < sizeof(TOKEN_USER)) {
         const DWORD error = GetLastError();
         if (error == ERROR_SUCCESS) throw std::runtime_error("invalid current-user token size");
         throw_win32(error);
     }
-    result.data.resize(needed);
-    if (!GetTokenInformation(result.token.get(), TokenUser, result.data.data(), needed, &needed)) {
+    std::vector<std::byte> data(needed);
+    if (!GetTokenInformation(token.get(), TokenUser, data.data(), needed, &needed)) {
         throw_win32(GetLastError());
     }
-    result.sid = reinterpret_cast<TOKEN_USER*>(result.data.data())->User.Sid;
-    return result;
+    const TOKEN_USER user = object_at<TOKEN_USER>(data, 0, "truncated current-user token");
+    if (!IsValidSid(user.User.Sid)) throw std::runtime_error("invalid current-user SID");
+    return UserIdentity(std::span(static_cast<const std::byte*>(user.User.Sid),
+                                  GetLengthSid(user.User.Sid)));
 }
 
 class RestrictedSecurity final {
 public:
+    ~RestrictedSecurity() = default;
+    RestrictedSecurity(const RestrictedSecurity&) = delete;
+    RestrictedSecurity& operator=(const RestrictedSecurity&) = delete;
+    RestrictedSecurity(RestrictedSecurity&&) = delete;
+    RestrictedSecurity& operator=(RestrictedSecurity&&) = delete;
+
     RestrictedSecurity(PSID user_sid, const DWORD inheritance_flags) {
         DWORD system_sid_size = static_cast<DWORD>(system_sid_.size());
         if (!CreateWellKnownSid(WinLocalSystemSid, nullptr, system_sid_.data(),
@@ -346,7 +384,7 @@ public:
     [[nodiscard]] SECURITY_ATTRIBUTES* attributes() noexcept { return &attributes_; }
 
 private:
-    std::array<std::byte, SECURITY_MAX_SID_SIZE> system_sid_{};
+    alignas(DWORD) std::array<std::byte, SECURITY_MAX_SID_SIZE> system_sid_{};
     std::vector<std::byte> acl_data_;
     SECURITY_DESCRIPTOR descriptor_{};
     SECURITY_ATTRIBUTES attributes_{};
@@ -365,9 +403,11 @@ void require_current_user_owner(const HANDLE handle, PSID expected_owner) {
     }
 }
 
-HANDLE open_access_raw(const fs::path& path, const DWORD access) {
-    return CreateFileW(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                       nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+UniqueHandle probe_access(const fs::path& path, const DWORD access) {
+    const HANDLE raw = CreateFileW(path.c_str(), access, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (raw == INVALID_HANDLE_VALUE) return {};
+    return UniqueHandle(raw);
 }
 
 void verify_denied(const Backup& backup, HANDLE handle);
@@ -387,7 +427,7 @@ bool has_current_user_execute_deny(const Backup& backup, PSID sid) {
             (header->AceFlags & INHERITED_ACE) != 0) continue;
         const auto* denied = static_cast<const ACCESS_DENIED_ACE*>(ace);
         if ((denied->Mask & FILE_EXECUTE) != 0 &&
-            EqualSid(const_cast<DWORD*>(&denied->SidStart), sid)) return true;
+            EqualSid(win32_input(&denied->SidStart), sid)) return true;
     }
     return false;
 }
@@ -435,17 +475,14 @@ std::vector<std::byte> make_denied_acl(const Backup& backup, PSID sid) {
 void verify_protection(const Backup& backup, const HANDLE handle) {
     verify_denied(backup, handle);
 
-    HANDLE readable_raw = open_access_raw(backup.path, GENERIC_READ);
-    if (readable_raw == INVALID_HANDLE_VALUE) {
+    const UniqueHandle readable = probe_access(backup.path, GENERIC_READ);
+    if (readable.get() == nullptr) {
         throw std::runtime_error("ordinary read access was unexpectedly blocked: " +
                                  windows_error(GetLastError()));
     }
-    UniqueHandle readable(readable_raw);
-
     SetLastError(ERROR_SUCCESS);
-    const HANDLE executable = open_access_raw(backup.path, GENERIC_EXECUTE);
-    if (executable != INVALID_HANDLE_VALUE) {
-        CloseHandle(executable);
+    const UniqueHandle executable = probe_access(backup.path, GENERIC_EXECUTE);
+    if (executable.get() != nullptr) {
         throw std::runtime_error("execute access remained available after applying the deny ACE");
     }
     const DWORD error = GetLastError();
@@ -664,7 +701,7 @@ std::vector<std::byte> protect_state(const std::span<const std::byte> plaintext)
         throw std::runtime_error("invalid recovery plaintext size");
     }
     DATA_BLOB input{static_cast<DWORD>(plaintext.size()),
-                    reinterpret_cast<BYTE*>(const_cast<std::byte*>(plaintext.data()))};
+                    static_cast<BYTE*>(win32_input(plaintext.data()))};
     DATA_BLOB protected_data{};
     if (!CryptProtectData(&input, L"D2SteamFix ACL recovery", nullptr, nullptr, nullptr,
                           CRYPTPROTECT_UI_FORBIDDEN, &protected_data)) {
@@ -676,7 +713,8 @@ std::vector<std::byte> protect_state(const std::span<const std::byte> plaintext)
     }
     std::vector<std::byte> output(state_magic.begin(), state_magic.end());
     const auto begin = reinterpret_cast<const std::byte*>(protected_data.pbData);
-    output.insert(output.end(), begin, begin + protected_data.cbData);
+    const auto protected_bytes = std::span(begin, protected_data.cbData);
+    output.insert(output.end(), protected_bytes.begin(), protected_bytes.end());
     return output;
 }
 
@@ -685,7 +723,7 @@ std::vector<std::byte> unprotect_state(const std::span<const std::byte> protecte
         throw std::runtime_error("invalid protected recovery size");
     }
     DATA_BLOB input{static_cast<DWORD>(protected_data.size()),
-                    reinterpret_cast<BYTE*>(const_cast<std::byte*>(protected_data.data()))};
+                    static_cast<BYTE*>(win32_input(protected_data.data()))};
     DATA_BLOB plaintext{};
     if (!CryptUnprotectData(&input, nullptr, nullptr, nullptr, nullptr,
                             CRYPTPROTECT_UI_FORBIDDEN, &plaintext)) {
@@ -696,7 +734,8 @@ std::vector<std::byte> unprotect_state(const std::span<const std::byte> protecte
         throw std::runtime_error("invalid recovery plaintext size");
     }
     const auto begin = reinterpret_cast<const std::byte*>(plaintext.pbData);
-    return std::vector<std::byte>(begin, begin + plaintext.cbData);
+    const auto plaintext_bytes = std::span(begin, plaintext.cbData);
+    return std::vector<std::byte>(plaintext_bytes.begin(), plaintext_bytes.end());
 }
 
 std::uint32_t take_u32(const std::span<const std::byte> data, size_t& offset) {
@@ -760,9 +799,8 @@ std::vector<RecoveryEntry> decode_payload(const std::span<const std::byte> data)
         }
         const size_t descriptor_end = checked_add(offset, descriptor_length);
         if (descriptor_end > data.size()) throw std::runtime_error("truncated descriptor");
-        std::vector<std::byte> descriptor(
-            data.begin() + static_cast<std::ptrdiff_t>(offset),
-            data.begin() + static_cast<std::ptrdiff_t>(descriptor_end));
+        const auto descriptor_bytes = data.subspan(offset, descriptor_length);
+        std::vector<std::byte> descriptor(descriptor_bytes.begin(), descriptor_bytes.end());
         offset = descriptor_end;
         static_cast<void>(descriptor_parts(descriptor));
 
@@ -772,9 +810,8 @@ std::vector<RecoveryEntry> decode_payload(const std::span<const std::byte> data)
         }
         const size_t denied_end = checked_add(offset, denied_length);
         if (denied_end > data.size()) throw std::runtime_error("truncated protected ACL");
-        std::vector<std::byte> denied_acl(
-            data.begin() + static_cast<std::ptrdiff_t>(offset),
-            data.begin() + static_cast<std::ptrdiff_t>(denied_end));
+        const auto denied_bytes = data.subspan(offset, denied_length);
+        std::vector<std::byte> denied_acl(denied_bytes.begin(), denied_bytes.end());
         offset = denied_end;
         static_cast<void>(acl_from_bytes(denied_acl));
         result.push_back(
@@ -799,7 +836,7 @@ void write_all(const HANDLE file, const std::span<const std::byte> data) {
         const size_t remaining = data.size() - offset;
         const DWORD requested = static_cast<DWORD>(std::min<size_t>(remaining, MAXDWORD));
         DWORD written = 0;
-        if (!WriteFile(file, data.data() + offset, requested, &written, nullptr)) {
+        if (!WriteFile(file, data.subspan(offset, requested).data(), requested, &written, nullptr)) {
             throw_win32(GetLastError());
         }
         if (written == 0) throw std::runtime_error("recovery file write made no progress");
@@ -824,6 +861,7 @@ void write_state(const fs::path& path, const std::span<const Backup> backups,
         file.reset();
         elevation::move_recovery_file(temporary, path);
     } catch (...) {
+        file.reset();
         try { elevation::remove_recovery_file(temporary); } catch (...) {}
         throw;
     }
@@ -838,8 +876,8 @@ std::vector<RecoveryEntry> read_state(const fs::path& path) {
         throw std::runtime_error("recovery state is not a regular, non-reparse file");
     }
     UserIdentity identity = current_user();
-    require_current_user_owner(file.get(), identity.sid);
-    RestrictedSecurity security(identity.sid, 0);
+    require_current_user_owner(file.get(), identity.sid());
+    RestrictedSecurity security(identity.sid(), 0);
     const DWORD acl_status = SetSecurityInfo(
         file.get(), SE_FILE_OBJECT,
         DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
@@ -856,7 +894,8 @@ std::vector<RecoveryEntry> read_state(const fs::path& path) {
         const DWORD requested = static_cast<DWORD>(
             std::min<size_t>(data.size() - offset, MAXDWORD));
         DWORD read = 0;
-        if (!ReadFile(file.get(), data.data() + offset, requested, &read, nullptr)) {
+        if (!ReadFile(file.get(), std::span(data).subspan(offset, requested).data(),
+                       requested, &read, nullptr)) {
             throw_win32(GetLastError());
         }
         if (read == 0) throw std::runtime_error("could not read complete recovery file");
@@ -983,11 +1022,15 @@ bool recover_pending(const fs::path& path, const Logger& log) {
     }
 }
 
-Protection Protection::apply(const std::vector<fs::path>& targets, fs::path state_path,
+Protection Protection::apply(const std::span<const fs::path> targets, fs::path state_path,
                              const Logger& log) {
     if (targets.empty() || targets.size() > max_entries) {
         throw AppError(ExitCode::overlay_protection, "ACL backup",
                        "expected one or two renderer targets");
+    }
+    if (targets.size() == 2 && paths::equal_windows(targets.front(), targets.back())) {
+        throw AppError(ExitCode::overlay_protection, "ACL backup",
+                       "renderer targets must refer to distinct files");
     }
     std::vector<Backup> backups;
     std::vector<UniqueHandle> handles;
@@ -1056,13 +1099,13 @@ Protection Protection::apply(const std::vector<fs::path>& targets, fs::path stat
     try {
         if (!resuming) {
             for (Backup& backup : backups) {
-                if (has_current_user_execute_deny(backup, identity.sid)) {
+                if (has_current_user_execute_deny(backup, identity.sid())) {
                     throw std::runtime_error(
                         "current-user execute access is already denied but no matching recovery "
                         "backup was found; preserve any existing steamfix.dat files: " +
                         display_path(backup.path));
                 }
-                backup.denied_acl = make_denied_acl(backup, identity.sid);
+                backup.denied_acl = make_denied_acl(backup, identity.sid());
             }
         }
     } catch (const std::exception& error) {
@@ -1071,7 +1114,7 @@ Protection Protection::apply(const std::vector<fs::path>& targets, fs::path stat
     try {
         if (!resuming) {
             remove_incomplete_state(state_path, log);
-            write_state(state_path, backups, identities, identity.sid);
+            write_state(state_path, backups, identities, identity.sid());
         }
     } catch (const AppError&) {
         throw;
@@ -1125,13 +1168,13 @@ void Protection::restore(const Logger& log) {
     log.info("restored original renderer permissions and removed recovery state");
 }
 
-Protection::~Protection() {
+Protection::~Protection() noexcept {
     if (state_ != State::active) return;
     try {
         restore_all(backups_, handles_);
         elevation::remove_recovery_file(state_path_);
         state_ = State::restored;
-    } catch (const std::exception&) {
+    } catch (...) {
     }
 }
 

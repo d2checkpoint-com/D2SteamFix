@@ -2,6 +2,6 @@
 
 namespace steamfix::app {
 
-int entry();
+int entry() noexcept;
 
 } // namespace steamfix::app

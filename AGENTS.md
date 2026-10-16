@@ -39,7 +39,7 @@ D2SteamFix is a Windows x64 C++20 launch wrapper for the Steam version of Destin
 
 ## Validation
 
-Follow [docs/BUILDING.md](docs/BUILDING.md) and build both Debug and Release on Windows x64 with MSVC. CI runs those builds for pushes and pull requests. This repository has no automated runtime test suite; do not claim runtime validation from a successful compile.
+Follow [docs/BUILDING.md](docs/BUILDING.md) and build both Debug and Release on Windows x64 with MSVC. CI runs those builds and the automated tests for pushes and pull requests. Tests use controlled fixtures; do not claim live Steam, desktop, UAC, or repair validation from a successful compile or unit-test run.
 
 For changes to launch, permissions, elevation, or repair, manually check the affected paths on a Windows test installation:
 

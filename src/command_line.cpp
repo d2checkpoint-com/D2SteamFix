@@ -1,5 +1,7 @@
 #include "steamfix/command_line.hpp"
 
+#include <cstddef>
+
 namespace steamfix::command_line {
 
 void append_quoted(std::wstring& line, const std::wstring_view argument) {
@@ -9,7 +11,7 @@ void append_quoted(std::wstring& line, const std::wstring_view argument) {
         return;
     }
     line.push_back(L'\"');
-    size_t slashes = 0;
+    std::size_t slashes = 0;
     for (const wchar_t character : argument) {
         if (character == L'\\') {
             ++slashes;
