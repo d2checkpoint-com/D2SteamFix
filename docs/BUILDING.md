@@ -138,9 +138,11 @@ descriptors, and registry fixtures owned by the test. They cover:
 
 Application tests replace dialogs with headless sinks; the real dialog code is
 also exercised by the separate UI test when a Windows desktop is available.
-That test reports a CTest skip (exit 77) if a desktop is unavailable before its
-initial UI check succeeds; subsequent failures fail the test. The suite does not
-launch an installed Steam client, change an installed game's permissions,
-request UAC, or perform a live Steam repair.
+An independent native window probe verifies desktop access before any test child
+is launched. Only recognized desktop-access failures in that probe report a
+CTest skip (exit 77); a missing or hung dialog always fails, including the first
+information dialog. Owned children that exit without a window or remain idle
+verify both failure paths. The suite does not launch an installed Steam client, change
+an installed game's permissions, request UAC, or perform a live Steam repair.
 See [AGENTS.md](../AGENTS.md) for the affected paths that still need manual
 Windows checks. Use the [README](../README.md) for installation and normal use.

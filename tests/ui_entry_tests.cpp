@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 
 namespace {
@@ -29,12 +30,73 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+enum class DialogFailure { exited_without_dialog, deadline };
+
+class DialogExpectationFailure final : public std::runtime_error {
+public:
+    explicit DialogExpectationFailure(const DialogFailure reason)
+        : std::runtime_error(reason == DialogFailure::exited_without_dialog
+                                 ? "child exited without its expected D2SteamFix dialog"
+                                 : "child did not display its expected D2SteamFix dialog before the deadline"),
+          reason_(reason) {}
+    [[nodiscard]] DialogFailure reason() const noexcept { return reason_; }
+private:
+    DialogFailure reason_;
+};
+
 void require(const bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
 [[noreturn]] void throw_windows_error() {
     throw std::system_error(steamfix::windows_exit_status(GetLastError()), std::system_category());
+}
+
+[[noreturn]] void desktop_probe_error(const char* operation) {
+    const DWORD error = GetLastError();
+    if (error == ERROR_ACCESS_DENIED || error == ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION) {
+        throw DesktopUnavailable(operation);
+    }
+    throw std::system_error(steamfix::windows_exit_status(error == ERROR_SUCCESS ? ERROR_GEN_FAILURE : error),
+                            std::system_category(), operation);
+}
+
+struct DestroyProbeWindow {
+    void operator()(const HWND window) const noexcept { DestroyWindow(window); }
+};
+
+struct ProbeSearch {
+    HWND expected;
+    bool found = false;
+};
+
+BOOL CALLBACK find_probe_window(const HWND window, const LPARAM context) noexcept {
+    auto& search = *reinterpret_cast<ProbeSearch*>(context);
+    if (window == search.expected) search.found = true;
+    return TRUE;
+}
+
+void verify_desktop() {
+    // These desktop/station handles are borrowed; Windows owns their lifetime.
+    SetLastError(ERROR_SUCCESS);
+    if (GetProcessWindowStation() == nullptr) desktop_probe_error("cannot access the process window station");
+    SetLastError(ERROR_SUCCESS);
+    if (GetThreadDesktop(GetCurrentThreadId()) == nullptr) desktop_probe_error("cannot access the thread desktop");
+    const HINSTANCE instance = GetModuleHandleW(nullptr);
+    if (instance == nullptr) throw_windows_error();
+    SetLastError(ERROR_SUCCESS);
+    // This native probe is independent of production dialogs. A hidden top-level
+    // window supports enumeration on accessible noninteractive desktops too.
+    const std::unique_ptr<std::remove_pointer_t<HWND>, DestroyProbeWindow> probe(
+        CreateWindowExW(0, L"STATIC", L"D2SteamFix test desktop probe", WS_POPUP,
+                         0, 0, 1, 1, nullptr, nullptr, instance, nullptr));
+    if (!probe) desktop_probe_error("cannot create a native desktop probe window");
+    ProbeSearch search{probe.get()};
+    SetLastError(ERROR_SUCCESS);
+    if (!EnumWindows(find_probe_window, reinterpret_cast<LPARAM>(&search))) {
+        desktop_probe_error("cannot enumerate the native desktop probe window");
+    }
+    require(search.found, "desktop enumeration omitted the test-owned native probe window");
 }
 
 fs::path current_executable() {
@@ -104,7 +166,6 @@ bool is_owned_dialog(const HWND window, const DWORD pid) noexcept {
 struct DialogSearch {
     DWORD pid;
     HWND found = nullptr;
-    bool child_window_exists = false;
 };
 
 BOOL CALLBACK find_dialog(const HWND window, const LPARAM context) noexcept {
@@ -113,39 +174,28 @@ BOOL CALLBACK find_dialog(const HWND window, const LPARAM context) noexcept {
     DWORD owner = 0;
     GetWindowThreadProcessId(window, &owner);
     if (owner != search.pid) return TRUE;
-    search.child_window_exists = true;
     if (!is_owned_dialog(window, search.pid)) return TRUE;
     search.found = window;
     return FALSE;
 }
 
-HWND wait_for_dialog(const ChildProcess& child, const DWORD expected_exit, const bool desktop_verified) {
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
-    bool child_window_exists = false;
+HWND wait_for_dialog(const ChildProcess& child, const DWORD expected_exit,
+                     const std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         DialogSearch search{child.pid()};
         const BOOL enumerated = EnumWindows(find_dialog, reinterpret_cast<LPARAM>(&search));
         if (search.found != nullptr) return search.found;
-        child_window_exists = child_window_exists || search.child_window_exists;
-        if (!enumerated) {
-            if (!desktop_verified) throw DesktopUnavailable("Windows could not enumerate the current desktop");
-            throw std::runtime_error("Windows could not enumerate the previously available desktop");
-        }
+        if (!enumerated) throw std::runtime_error("Windows could not enumerate the previously verified desktop");
         const DWORD wait = WaitForSingleObject(child.get(), 0);
         if (wait == WAIT_FAILED) throw_windows_error();
         if (wait == WAIT_OBJECT_0) {
             require(child.exit_status() == expected_exit, "dialog child exited with an unexpected status");
-            if (!desktop_verified && !child_window_exists) {
-                throw DesktopUnavailable("the current desktop could not display the information dialog");
-            }
-            throw std::runtime_error("child exited without its expected D2SteamFix dialog");
+            throw DialogExpectationFailure(DialogFailure::exited_without_dialog);
         }
         Sleep(50);
     }
-    if (!desktop_verified && !child_window_exists) {
-        throw DesktopUnavailable("the current desktop could not expose the child information dialog");
-    }
-    throw std::runtime_error("child did not display its expected D2SteamFix dialog within eight seconds");
+    throw DialogExpectationFailure(DialogFailure::deadline);
 }
 
 struct TextSearch {
@@ -204,11 +254,26 @@ void inspect_and_close(const HWND dialog, const ChildProcess& child,
 }
 
 void check_dialog(const fs::path& executable, const std::wstring_view argument,
-                   const std::wstring_view expected_text, const DWORD expected_exit,
-                   const bool desktop_verified) {
+                   const std::wstring_view expected_text, const DWORD expected_exit) {
     const ChildProcess child(executable, argument);
-    const HWND dialog = wait_for_dialog(child, expected_exit, desktop_verified);
+    const HWND dialog = wait_for_dialog(child, expected_exit, std::chrono::seconds(8));
     inspect_and_close(dialog, child, expected_text, expected_exit);
+}
+
+void check_missing_dialog_failure(const fs::path& executable, const std::wstring_view argument,
+                                  const DialogFailure expected, const std::chrono::milliseconds timeout) {
+    const ChildProcess child(executable, argument);
+    try {
+        static_cast<void>(wait_for_dialog(child, 0, timeout));
+    } catch (const DialogExpectationFailure& error) {
+        require(error.reason() == expected, "a no-dialog child failed for the wrong reason");
+        return;
+    } catch (const DesktopUnavailable&) {
+        // A future regression must fail the parent suite rather than reach its
+        // desktop-skip handler. Other setup/API errors propagate as failures.
+        throw std::runtime_error("a missing or hung dialog was skipped instead of failing");
+    }
+    throw std::runtime_error("a no-dialog child unexpectedly displayed a D2SteamFix dialog");
 }
 
 struct CommandLineDeleter {
@@ -226,6 +291,11 @@ int main() {
         }
         const std::span parsed{arguments.get(), static_cast<std::size_t>(count)};
         const std::wstring_view argument = parsed[1];
+        if (argument == L"--no-dialog") return 0;
+        if (argument == L"--idle-before-dialog") {
+            Sleep(30000);
+            return 0;
+        }
         if (argument == L"--show-info") {
             steamfix::ui::info(information_text);
             return 0;
@@ -234,13 +304,18 @@ int main() {
             steamfix::ui::error(error_text);
             return 0;
         }
+        const fs::path self = current_executable();
         const fs::path executable(argument);
         require(fs::is_regular_file(executable), "built steamfix executable is missing");
-        const fs::path self = current_executable();
-        check_dialog(self, L"--show-info", information_text, 0, false);
-        check_dialog(self, L"--show-error", error_text, 0, true);
+        verify_desktop();
+        check_missing_dialog_failure(self, L"--no-dialog", DialogFailure::exited_without_dialog,
+                                     std::chrono::seconds(3));
+        check_missing_dialog_failure(self, L"--idle-before-dialog", DialogFailure::deadline,
+                                     std::chrono::milliseconds(500));
+        check_dialog(self, L"--show-info", information_text, 0);
+        check_dialog(self, L"--show-error", error_text, 0);
         check_dialog(executable, L"D2SteamFix-test-invalid-forwarded.exe",
-                      L"the forwarded executable must be destiny2launcher.exe", 12, true);
+                      L"the forwarded executable must be destiny2launcher.exe", 12);
         std::cout << "Real information/error dialogs and steamfix validation entry passed.\n";
     } catch (const DesktopUnavailable& error) {
         std::cout << "SKIP: UI/entry dialog tests: " << error.what() << '\n';
