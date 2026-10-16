@@ -7,12 +7,18 @@
 #include <shellapi.h>
 
 #include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <vector>
+
+namespace fs = std::filesystem;
 
 namespace app_fault {
 
 enum class Kind { process_error, cancelled, relaunch, standard_error, unexpected_error, real_launch };
+enum class Retry { status, unknown_status, cancelled, failure };
 
 struct Plan {
     Kind kind = Kind::process_error;
@@ -20,6 +26,12 @@ struct Plan {
     bool elevated = false;
     std::filesystem::path steam;
     int cleanup_failures = 0;
+    std::wstring entry_command{};
+    std::filesystem::path launcher{};
+    Retry retry = Retry::status;
+    bool parse_failure = false;
+    bool executable_failure = false;
+    bool existing_session = false;
 };
 
 struct UnexpectedFailure final {};
@@ -29,19 +41,30 @@ struct UnexpectedFailure final {};
 thread_local const Plan* active = nullptr;
 thread_local bool restoring = false;
 thread_local int cleanup_failures = 0;
+thread_local int retry_calls = 0;
+thread_local bool retry_restored = false;
+thread_local int error_messages = 0;
 
 class Scope final {
 public:
     explicit Scope(const Plan& plan) noexcept
-        : previous_(active), previous_restoring_(restoring), previous_failures_(cleanup_failures) {
+        : previous_(active), previous_restoring_(restoring), previous_failures_(cleanup_failures),
+          previous_retry_calls_(retry_calls), previous_retry_restored_(retry_restored),
+          previous_messages_(error_messages) {
         active = &plan;
         restoring = false;
         cleanup_failures = plan.cleanup_failures;
+        retry_calls = 0;
+        retry_restored = false;
+        error_messages = 0;
     }
     ~Scope() noexcept {
         active = previous_;
         restoring = previous_restoring_;
         cleanup_failures = previous_failures_;
+        retry_calls = previous_retry_calls_;
+        retry_restored = previous_retry_restored_;
+        error_messages = previous_messages_;
     }
     Scope(const Scope&) = delete;
     Scope& operator=(const Scope&) = delete;
@@ -51,7 +74,41 @@ private:
     const Plan* previous_;
     bool previous_restoring_;
     int previous_failures_;
+    int previous_retry_calls_;
+    bool previous_retry_restored_;
+    int previous_messages_;
 };
+
+LPCWSTR command_line() {
+    return active != nullptr && !active->entry_command.empty()
+               ? active->entry_command.c_str() : ::GetCommandLineW();
+}
+
+LPWSTR* WINAPI parse_command_line(LPCWSTR command, int* count) {
+    if (active != nullptr && active->parse_failure) {
+        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+    return ::CommandLineToArgvW(command, count);
+}
+
+DWORD WINAPI module_name(HMODULE module, LPWSTR buffer, DWORD size) {
+    if (active != nullptr && active->executable_failure) {
+        SetLastError(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    return ::GetModuleFileNameW(module, buffer, size);
+}
+
+HANDLE WINAPI session_mutex(LPSECURITY_ATTRIBUTES security, BOOL owner, LPCWSTR name) {
+    if (active == nullptr || active->entry_command.empty()) return ::CreateMutexW(security, owner, name);
+    if (name == nullptr || std::wstring_view(name) != L"Global\\D2SteamFix-1085660") {
+        throw std::logic_error("unexpected fixture session mutex");
+    }
+    const HANDLE handle = ::CreateMutexW(security, owner, nullptr);
+    if (handle != nullptr && active->existing_session) SetLastError(ERROR_ALREADY_EXISTS);
+    return handle;
+}
 
 DWORD WINAPI set_security(const HANDLE handle, const SE_OBJECT_TYPE type, const SECURITY_INFORMATION information,
                           PSID owner, PSID group, PACL dacl, PACL sacl) {
@@ -77,6 +134,18 @@ BOOL WINAPI create_process(LPCWSTR application, LPWSTR command, LPSECURITY_ATTRI
 } // namespace app_fault
 
 namespace steamfix::elevation {
+
+std::optional<fs::path> app_test_accept_launch(std::vector<std::wstring>& arguments) {
+    if (app_fault::active == nullptr || app_fault::active->entry_command.empty()) return accept_elevated_launch(arguments);
+    if (arguments.size() != 2 || fs::path(arguments.front()) != app_fault::active->launcher ||
+        arguments.back() != L"--fixture-launcher") {
+        throw std::logic_error("entry fixture did not supply its exact owned launcher command");
+    }
+    return app_fault::active->steam;
+}
+
+std::optional<int> app_test_relaunch(const std::vector<std::wstring>& arguments,
+                                    const fs::path& directory, const fs::path& steam_directory);
 
 bool app_test_is_elevated() {
     return app_fault::active != nullptr ? app_fault::active->elevated : is_elevated();
@@ -113,10 +182,50 @@ bool app_test_desktop_launch(const std::filesystem::path& executable, const std:
 #define CreateProcessW app_fault::create_process
 #define is_elevated app_test_is_elevated
 #define launch_as_desktop_user app_test_desktop_launch
+#define accept_elevated_launch app_test_accept_launch
+#define relaunch_as_administrator app_test_relaunch
+#define GetCommandLineW app_fault::command_line
+#define CommandLineToArgvW app_fault::parse_command_line
+#define GetModuleFileNameW app_fault::module_name
+#define CreateMutexW app_fault::session_mutex
 #include "../src/app.cpp"
+#undef CreateMutexW
+#undef GetModuleFileNameW
+#undef CommandLineToArgvW
+#undef GetCommandLineW
+#undef relaunch_as_administrator
+#undef accept_elevated_launch
 #undef CreateProcessW
 #undef is_elevated
 #undef launch_as_desktop_user
+
+namespace steamfix::elevation {
+
+std::optional<int> app_test_relaunch(const std::vector<std::wstring>& arguments,
+                                    const fs::path& directory, const fs::path& steam_directory) {
+    if (app_fault::active == nullptr || app_fault::active->entry_command.empty()) {
+        return relaunch_as_administrator(arguments, directory, steam_directory);
+    }
+    ++app_fault::retry_calls;
+    if (arguments.size() != 2 || fs::path(arguments.front()) != app_fault::active->launcher ||
+        arguments.back() != L"--fixture-launcher" ||
+        directory != app_fault::active->launcher.parent_path() || steam_directory != app_fault::active->steam ||
+        fs::exists(directory / L"steamfix.dat")) {
+        throw std::logic_error("administrator retry preceded restoration or escaped its fixture");
+    }
+    const Logger log(directory / L"steamfix.log");
+    if (repair::needed(steam_directory, log)) throw std::logic_error("administrator retry retained execute denial");
+    app_fault::retry_restored = true;
+    switch (app_fault::active->retry) {
+    case app_fault::Retry::status: return 23;
+    case app_fault::Retry::unknown_status: return std::nullopt;
+    case app_fault::Retry::cancelled: throw Cancelled();
+    case app_fault::Retry::failure: throw std::runtime_error("controlled administrator launch failure");
+    }
+    throw std::logic_error("unknown administrator retry fixture");
+}
+
+} // namespace steamfix::elevation
 
 #include <objbase.h>
 
@@ -471,6 +580,46 @@ void check_session(const fs::path& directory) {
         // the consumed transient fault and restores the original permissions.
         check_restored();
     }
+    std::wstring entry_command;
+    command_line::append_quoted(entry_command, self.native());
+    for (const auto& argument : arguments) command_line::append_quoted(entry_command, argument);
+    for (const auto retry : {app_fault::Retry::status, app_fault::Retry::unknown_status,
+                             app_fault::Retry::cancelled, app_fault::Retry::failure}) {
+        const app_fault::Plan plan{app_fault::Kind::relaunch, ERROR_ACCESS_DENIED, false, steam,
+                                   0, entry_command, launcher, retry};
+        const app_fault::Scope faults(plan);
+        const int expected = retry == app_fault::Retry::status ? 23 :
+                             retry == app_fault::Retry::failure ? static_cast<int>(ExitCode::process_creation) : 0;
+        require(app::entry() == expected && app_fault::retry_calls == 1 && app_fault::retry_restored,
+                "entry administrator retry follows restoration and preserves its outcome");
+        require(app_fault::error_messages == (retry == app_fault::Retry::failure ? 1 : 0),
+                "entry reports administrator retry failures without treating cancellation as an error");
+        check_restored();
+    }
+    for (const auto kind : {app_fault::Kind::process_error, app_fault::Kind::cancelled,
+                            app_fault::Kind::standard_error, app_fault::Kind::unexpected_error}) {
+        const app_fault::Plan plan{kind, ERROR_BAD_EXE_FORMAT, false, steam, 0, entry_command, launcher};
+        const app_fault::Scope faults(plan);
+        const int expected = kind == app_fault::Kind::cancelled ? 0 :
+                             static_cast<int>(kind == app_fault::Kind::process_error ?
+                                              ExitCode::process_creation : ExitCode::internal);
+        require(app::entry() == expected && app_fault::retry_calls == 0,
+                "entry translates coordinator failures without requesting administrator launch");
+        require(app_fault::error_messages == (kind == app_fault::Kind::cancelled ? 0 : 1),
+                "entry emits exactly one diagnostic for a noncancelled failure");
+        check_restored();
+    }
+    for (int failure = 0; failure < 3; ++failure) {
+        const app_fault::Plan plan{app_fault::Kind::process_error, ERROR_BAD_EXE_FORMAT, false, steam,
+                                   0, entry_command, launcher, app_fault::Retry::status,
+                                   failure == 0, failure == 1, failure == 2};
+        const app_fault::Scope faults(plan);
+        const int expected = static_cast<int>(failure == 0 ? ExitCode::invalid_invocation :
+                                              failure == 1 ? ExitCode::internal : ExitCode::existing_session);
+        require(app::entry() == expected && app_fault::retry_calls == 0 && app_fault::error_messages == 1,
+                "entry rejects startup failures inside its nonthrowing boundary");
+        check_restored();
+    }
     // A valid path with invalid executable bytes forces CreateProcess failure
     // after the recovery journal and execute denial have been established.
     write_file(launcher, "invalid executable");
@@ -493,7 +642,9 @@ void check_session(const fs::path& directory) {
 // separately in the coverage inventory, so its untested lines remain visible.
 namespace steamfix::ui {
 void info(std::wstring_view) noexcept {}
-void error(std::wstring_view) noexcept {}
+void error(std::wstring_view) noexcept {
+    if (app_fault::active != nullptr) ++app_fault::error_messages;
+}
 }
 
 int main() {

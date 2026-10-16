@@ -62,7 +62,8 @@ complete message remains serialized.
 
 **ES.46, ES.48, ES.50, SL.con.1, P.4.** Private IPC uses const-correct spans and
 explicit wire layout without padding disclosure. Rename lengths are checked
-before conversion. Token headers are copied into typed locals, the privilege
+before conversion; the native rename buffer has deterministic padding and an
+explicit trailing terminator. Token headers are copied into typed locals, the privilege
 record has typed aligned storage, and application-owned fixed buffers use
 `std::array`. Windows exit-code bits use an explicit same-width `bit_cast` at the
 signed application boundary.
@@ -73,6 +74,8 @@ startup, logging, and even failure-message formatting. Stage-specific errors
 and the recovery journal remain available for diagnosis. A missing optional
 32-bit renderer is distinguished from a filesystem inspection failure, including
 standard-library implementations that also set an error code for a missing path.
+Permission probes explicitly reject invalid handles, including the sentinel
+whose bit pattern is also Windows' current-process pseudo-handle.
 
 **SF.8, SF.10, SF.11, Con.1.** All project headers use standard component-specific
 include guards and compile independently, including when included twice. Headers
@@ -126,15 +129,27 @@ No selected rule is disabled globally. Other reports were resolved by removing
 a borrowed recovery-entry pointer, using immutable span views, copying a
 timestamp value, and constructing the logger directly in its final scope.
 
-Tests exercise actual production implementations and real Windows APIs on
+Nine test suites exercise actual production implementations and real Windows APIs on
 test-owned directories, registry overrides, pipes, mutexes, module fixtures, and
 child processes. They include malformed recovery inputs, DPAPI round trips,
 permission restoration and interrupted recovery, transport failures, process
 monitoring state, quoted/Unicode arguments, and launch failure cleanup. The
 application session test starts copies of the test program under the validated
-launcher/game names inside its own temporary tree. It never launches real Steam
-or Destiny 2. Dialogs in the application test are captured to keep CI
-noninteractive; their production implementation still contributes to coverage.
+launcher/game names inside its own temporary tree. Coordinator and repair tests
+also supply finite failures at scoped external boundaries to check restoration,
+cancellation, shutdown, verification, and recovery preservation. Repair discovery
+and consent responses stay within the fixture; native file/token operations and
+termination act on owned resources. No installed Steam client or Destiny 2 game
+is launched. Application test dialogs use headless sinks; a separate test reads
+and dismisses real production dialogs belonging to its own children and tests
+the built wrapper's invalid-invocation entry point. An unavailable desktop is
+reported as a skip, never as successful UI validation.
+
+Independent reviewers checked production changes outside their original file
+ownership, then cross-reviewed the integrated test boundaries, native contracts,
+cleanup lifetimes, and coverage inventory. Findings were resolved before the
+final review; the resulting review reported no actionable regressions. This is
+review evidence, rather than a proof of complete guideline conformance.
 
 Debug CI collects OpenCppCoverage HTML and Cobertura reports plus an uncovered
 line summary. An inventory executable retains every production translation unit

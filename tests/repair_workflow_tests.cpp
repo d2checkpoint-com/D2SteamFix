@@ -110,12 +110,18 @@ struct PickerAction {
     fs::path path;
 };
 
+fs::path make_game_directory(const fs::path& root) {
+    const fs::path game = root / L"game";
+    require(fs::create_directory(game), "create repair fixture game directory");
+    return game;
+}
+
 struct Plan {
     TestDirectory temporary;
-    fs::path game = temporary.path() / L"game";
+    fs::path game = make_game_directory(temporary.path());
     fs::path steam = temporary.path() / L"Steam";
     fs::path recovery = game / L"steamfix.dat";
-    std::unique_ptr<steamfix::Logger> logger;
+    const steamfix::Logger logger{game / L"steamfix.log"};
     std::map<DWORD, fs::path> owned_processes;
     std::vector<UniqueHandle> process_lifetimes;
     std::vector<PickerAction> picker_actions;
@@ -142,7 +148,6 @@ struct Plan {
     std::jthread watchdog;
 
     explicit Plan(const bool renderer32 = true, const std::string_view recreation = "both") {
-        fs::create_directory(game);
         fs::create_directory(steam);
         fs::copy_file(executable_path(), steam / L"steam.exe");
         write_file(steam / L".d2steamfix-test-owner",
@@ -153,14 +158,10 @@ struct Plan {
         for (const auto* name : {L"steamfix.dat", L"steamfix.dat.tmp", L"steamfix.dat.old"}) {
             write_file(game / name, "preserved recovery state");
         }
-        logger = std::make_unique<steamfix::Logger>(game / L"steamfix.log");
-        logger->info("repair workflow fixture log must survive repair");
+        logger.info("repair workflow fixture log must survive repair");
     }
 
-    [[nodiscard]] const steamfix::Logger& log() const {
-        if (!logger) throw std::runtime_error("repair fixture logger is absent");
-        return *logger;
-    }
+    [[nodiscard]] const steamfix::Logger& log() const noexcept { return logger; }
     [[nodiscard]] bool owns(const fs::path& path) const {
         const fs::path relative = fs::weakly_canonical(path).lexically_relative(fs::canonical(temporary.path()));
         return !relative.empty() && !relative.is_absolute() && *relative.begin() != L"..";
@@ -624,9 +625,9 @@ void check_picker_cancellation_and_failure() {
     }
 }
 
-int recreate_owned_renderers(const std::span<wchar_t*> arguments) {
-    if (arguments.size() != 4 || std::wstring_view(arguments[1]) != L"-forcesteamupdate" ||
-        std::wstring_view(arguments[2]) != L"-forcepackagedownload" || std::wstring_view(arguments[3]) != L"-exitsteam") return 90;
+int recreate_owned_renderers(const std::vector<std::wstring>& arguments) {
+    if (arguments.size() != 4 || arguments[1] != L"-forcesteamupdate" ||
+        arguments[2] != L"-forcepackagedownload" || arguments[3] != L"-exitsteam") return 90;
     const fs::path directory = fs::canonical(fs::current_path());
     if (!directory.parent_path().filename().native().starts_with(L"D2SteamFix repair tests ") ||
         !steamfix::paths::equal_windows(executable_path(), directory / L"steam.exe")) return 91;
@@ -652,8 +653,14 @@ int main() {
         const std::unique_ptr<wchar_t*, repair_workflow::CommandLineDeleter> arguments(CommandLineToArgvW(GetCommandLineW(), &count));
         if (!arguments || count <= 0) throw std::runtime_error("could not read repair workflow arguments");
         const std::span parsed{arguments.get(), static_cast<std::size_t>(count)};
+        std::vector<std::wstring> owned_arguments;
+        owned_arguments.reserve(parsed.size());
+        for (const auto argument : parsed) {
+            if (argument == nullptr) throw std::runtime_error("repair workflow argument was null");
+            owned_arguments.emplace_back(argument);
+        }
         if (steamfix::paths::name_is(repair_workflow::executable_path(), L"steam.exe")) {
-            return repair_workflow::recreate_owned_renderers(parsed);
+            return repair_workflow::recreate_owned_renderers(owned_arguments);
         }
         repair_workflow::require(count == 1, "unexpected repair workflow test arguments");
         repair_workflow::check_cancellation();

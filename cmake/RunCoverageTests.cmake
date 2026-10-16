@@ -1,3 +1,5 @@
+file(REMOVE "${STEAMFIX_BINARY_DIR}/Testing/Temporary/LastTest.log")
+
 execute_process(COMMAND "${STEAMFIX_INVENTORY}" RESULT_VARIABLE inventory_status)
 if(NOT "${inventory_status}" STREQUAL "0")
     message(FATAL_ERROR "Coverage inventory failed: ${inventory_status}")

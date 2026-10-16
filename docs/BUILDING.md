@@ -83,6 +83,8 @@ This builds Debug in `build-coverage` and runs the tests under OpenCppCoverage.
 The results are written to `build-coverage\coverage`: `html\index.html` shows
 annotated sources, `coverage.xml` contains Cobertura data, and `summary.md` gives
 the measured total, per-file coverage, and every uncovered executable line range.
+`LastTest.log` retains output from passing suites too, including any conditional
+privilege or filesystem skips; `LastCoverageResults.log` records the collector.
 The Debug CI job publishes the same files as the
 `steamfix-windows-x64-coverage` artifact and adds the summary to the workflow run.
 

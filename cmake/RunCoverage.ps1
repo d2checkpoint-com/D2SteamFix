@@ -25,6 +25,10 @@ if (-not (Test-Path $OpenCppCoverage)) {
 
 $outputRoot = Join-Path $buildRoot "coverage"
 New-Item -ItemType Directory -Force $outputRoot | Out-Null
+$archivedTestLog = Join-Path $outputRoot "LastTest.log"
+if (Test-Path $archivedTestLog) {
+    Remove-Item -LiteralPath $archivedTestLog -Force
+}
 $coverageArguments = @(
     "--cover_children",
     "--continue_after_cpp_exception",
@@ -43,6 +47,10 @@ $coverageArguments = @(
 $coverageStatus = $LASTEXITCODE
 if (Test-Path "LastCoverageResults.log") {
     Copy-Item "LastCoverageResults.log" (Join-Path $outputRoot "LastCoverageResults.log") -Force
+}
+$testLog = Join-Path $buildRoot "Testing/Temporary/LastTest.log"
+if (Test-Path $testLog) {
+    Copy-Item $testLog $archivedTestLog -Force
 }
 
 if (Test-Path (Join-Path $outputRoot "coverage.xml")) {

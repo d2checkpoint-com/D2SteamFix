@@ -89,6 +89,22 @@ bool check_text_conversion() {
         std::cerr << "Text conversion changed UTF-8, embedded NULs, or empty input.\n";
         return false;
     }
+    // Diagnostics must remain printable even when a native message contains an
+    // isolated surrogate or bytes from the current ANSI code page.
+    if (steamfix::narrow(L"\xD800") != "\xEF\xBF\xBD") {
+        std::cerr << "An isolated UTF-16 surrogate was not replaced safely.\n";
+        return false;
+    }
+    constexpr std::string_view invalid_utf8{"\xFF"};
+    std::array<wchar_t, 2> ansi{};
+    const int count = MultiByteToWideChar(CP_ACP, 0, invalid_utf8.data(),
+                                         static_cast<int>(invalid_utf8.size()), ansi.data(),
+                                         static_cast<int>(ansi.size()));
+    if (count <= 0 || steamfix::widen(invalid_utf8) !=
+                          std::wstring_view(ansi.data(), static_cast<std::size_t>(count))) {
+        std::cerr << "Invalid UTF-8 did not fall back to the current ANSI code page.\n";
+        return false;
+    }
     return true;
 }
 
