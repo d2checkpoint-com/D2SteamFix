@@ -167,12 +167,28 @@ including production headers with emitted code; it is not branch coverage.
 Coverage is reported as measured, without excluding difficult code to inflate
 the percentage or replacing the user's goal with a lower arbitrary threshold.
 
-Local verification so far: all production translation units and the initial
-tests cross-compile as Windows x64 C++20 with MinGW GCC 14 and warnings as errors;
-the application links against the Windows libraries. Portable command-line
-expectations pass under GCC. This supplements, and does not replace, the
-supported MSVC Debug/Release builds and Windows execution. Final CI and expanded
-suite results are recorded in the pull request.
+Native [Windows validation](https://github.com/d2checkpoint-com/D2SteamFix/actions/runs/38960070921)
+of implementation commit `bf16998` passes MSVC Debug and Release builds with
+`/W4 /WX`, all eleven selected Core Check rules, and all nine suites in each
+configuration, with no conditional or CTest skips. Tests include real production
+dialogs and the built wrapper's entry point. Independent production and
+integrated test cross-reviews report no
+open actionable findings.
+
+Measured full-source executable-line coverage is **89.47% (2,370/2,649)**.
+ACL/recovery reaches 91.41%; process monitoring and repair each reach 93.47%.
+The workflow's `steamfix-windows-x64-coverage` artifact contains annotated HTML,
+Cobertura, every uncovered line range, and the complete test log. The remaining
+lines stay in the denominator, including native API failure paths, size/resource
+limits, desktop-token launches, and exceptional recovery/initialization paths.
+The suite does not reach 100%; no lower percentage is treated as proof of
+completeness. Journal write/flush and partial-denial failures specifically check
+temporary-file cleanup, rollback, and preservation of real recovery state.
+
+Supplementary checks also pass: Windows x64 C++20 cross-compilation/linking with
+MinGW GCC 14 and warnings as errors, portable command-line expectations under
+GCC, and independent/repeated inclusion of all thirteen public headers. Native
+MSVC execution above is the supported-platform evidence.
 
 Live Steam behavior, UAC consent/cancellation, alternate administrator accounts,
 and destructive repair against a real installation require the manual Windows

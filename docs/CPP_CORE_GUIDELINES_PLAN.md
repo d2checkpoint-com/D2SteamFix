@@ -15,9 +15,9 @@ D2SteamFix temporarily changes Steam overlay permissions and restores them when 
 - [x] (2026-10-16) Assigned independent owners for ACL recovery, elevation, runtime operations, and build checks; coordinator owns application and shared support code.
 - [x] (2026-10-16) Complete review and fixes across every C++ source/header and build configuration.
 - [x] (2026-10-16) Integrate nine real-Windows fixture test suites, analyzer checks, and complete-source coverage reporting; all production and test executables cross-compile and link with MinGW warnings as errors.
-- [ ] Run supported MSVC Debug/Release builds, Windows regression suites, and production coverage in CI.
+- [x] (2026-10-16) Run supported MSVC Debug/Release builds, Windows regression suites, and production coverage in CI.
 - [x] (2026-10-16) Record exceptions and validation limits, commit version 1.1.1, and open [pull request 18](https://github.com/d2checkpoint-com/D2SteamFix/pull/18).
-- [ ] Finish native CI and measured coverage, address testable gaps, complete final cross-review, and update the pull request with exact evidence.
+- [x] (2026-10-16) Finish native CI and measured coverage, address testable gaps, and complete final independent cross-review. Publish the final evidence in pull request 18.
 
 ## Surprises & Discoveries
 
@@ -46,7 +46,9 @@ On 2026-10-16, native MSVC analysis reported valid owner lifetimes as invalid af
 ## Outcomes & Retrospective
 
 
-Production review and corrective implementation are complete. Nine suites cover command-line quoting, resource/conversion helpers, application sessions and entry failures, ACL/recovery, elevation/IPC, runtime helpers, finite process-observation failures, confined repair workflows, and actual production dialogs/entry. All binaries cross-compile and link with MinGW warnings as errors; all thirteen public headers compile independently and on repeated inclusion. Independent cross-review found and resolved exception-copy safety, an overly broad test deny mask, incorrect error expectations, and canonical Windows path comparisons in a test. Separate final production reviewers reported no actionable regressions outside their original file ownership. Pull request 18 is open as a draft. Native production builds and selected analysis pass in Debug/Release; final expanded-suite outcomes and measured coverage remain pending.
+Production review and corrective implementation are complete. Nine suites cover command-line quoting, resource/conversion helpers, application sessions and entry failures, ACL/recovery, elevation/IPC, runtime helpers, finite process-observation failures, confined repair workflows, and actual production dialogs/entry. [Native Windows run 38960070921](https://github.com/d2checkpoint-com/D2SteamFix/actions/runs/38960070921) validates implementation commit bf16998: MSVC Debug/Release with /W4 /WX, all eleven selected Core Check rules, and all nine suites pass in both configurations. Full-source line coverage is 89.47% (2,370/2,649), including uncalled production code. Annotated HTML, Cobertura, uncovered ranges, and the full test log are in its coverage artifact. This falls short of 100%; native error/resource limits and live desktop/UAC/alternate-account paths remain explicit gaps.
+
+Supplementary MinGW compilation/linking and portable quoting checks pass; all thirteen public headers compile independently and on repeated inclusion. Independent cross-review found and resolved exception-copy safety, an overly broad test deny mask, incorrect error expectations, and canonical Windows path comparisons in a test. Final production reviewers checked files outside their original ownership; integrated reviewers checked the completed tests and their resource/action boundaries. They report no open actionable findings. Version 1.1.1 is proposed in pull request 18; no merge, tag, release publication, or live Steam repair was performed.
 
 ## Context and Orientation
 
