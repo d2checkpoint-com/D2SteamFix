@@ -86,9 +86,10 @@ fs::path executable_path(HANDLE process = nullptr) {
 template <typename Byte, std::size_t Extent>
     requires std::same_as<Byte, std::byte> || std::same_as<Byte, const std::byte>
 void transfer(const HANDLE pipe, const std::span<Byte, Extent> data, const DWORD timeout = pipe_timeout) {
-    std::span<Byte> bytes = data;
     UniqueHandle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    while (!bytes.empty()) {
+    std::size_t offset = 0;
+    while (offset < data.size()) {
+        const auto bytes = data.subspan(offset);
         const DWORD requested = static_cast<DWORD>(std::min<std::size_t>(bytes.size(), MAXDWORD));
         DWORD completed = 0;
         OVERLAPPED overlap{};
@@ -115,7 +116,7 @@ void transfer(const HANDLE pipe, const std::span<Byte, Extent> data, const DWORD
         }
         if (completed == 0) fail(ERROR_BROKEN_PIPE);
         if (completed > requested) fail(ERROR_INVALID_DATA);
-        bytes = bytes.subspan(completed);
+        offset += completed;
     }
 }
 

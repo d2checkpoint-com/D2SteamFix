@@ -26,7 +26,6 @@ function(steamfix_enable_code_analysis target)
             VS_GLOBAL_CodeAnalysisRuleSet "${STEAMFIX_CODE_ANALYSIS_RULESET}"
             VS_GLOBAL_CodeAnalysisTreatWarningsAsErrors true
         )
-        target_compile_options(${target} PRIVATE /analyze:WX)
     endif()
 endfunction()
 

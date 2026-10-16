@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <exception>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -254,12 +255,12 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
     log.info("selected renderer DLL: " + display_path(renderer64));
     const fs::path renderer32 = steam_directory / L"GameOverlayRenderer.dll";
     std::error_code renderer32_error;
-    const bool renderer32_exists = fs::is_regular_file(renderer32, renderer32_error);
-    if (renderer32_error) {
+    const fs::file_status renderer32_status = fs::status(renderer32, renderer32_error);
+    if (renderer32_error && renderer32_status.type() != fs::file_type::not_found) {
         throw AppError(ExitCode::steam_discovery, "renderer discovery",
                        display_path(renderer32) + ": " + renderer32_error.message());
     }
-    if (renderer32_exists) {
+    if (fs::is_regular_file(renderer32_status)) {
         log.info("selected renderer DLL: " + display_path(renderer32));
         targets.push_back(renderer32);
     } else {
@@ -424,9 +425,9 @@ int entry() noexcept try {
                   L"recovery files.\n\n" + widen(error.what()) + L"\n\nDestiny 2 was not started.");
         return static_cast<int>(ExitCode::log_initialization);
     }
-    std::optional<Logger> log;
+    std::unique_ptr<Logger> log;
     try {
-        log.emplace(game_directory / L"steamfix.log");
+        log = std::make_unique<Logger>(game_directory / L"steamfix.log");
     } catch (const elevation::Cancelled&) {
         return 0;
     } catch (const std::exception& error) {

@@ -100,6 +100,11 @@ void check_errors() {
     AppError moved(std::move(error));
     copied = moved;
     copied = std::move(moved);
+    // AppError explicitly implements move as a nonthrowing copy, retaining both
+    // accessor invariants. This assertion intentionally checks that contract.
+#ifdef _MSC_VER
+#pragma warning(suppress : 26800)
+#endif
     require(error.stage() == "validation" && moved.detail() == "detail" && copied.launcher_started(),
             "exception copies and moves preserve context");
     const auto captured = std::make_exception_ptr(copied);
@@ -271,14 +276,15 @@ void info(std::wstring_view) noexcept {}
 void error(std::wstring_view) noexcept {}
 }
 
-int main(int argc, char** argv) {
+int main() {
     try {
-        if (argc == 2 && std::string_view{argv[1]} == "--fixture-game") {
+        const auto arguments = steamfix::app::command_line_arguments();
+        if (arguments == std::vector<std::wstring>{L"--fixture-game"}) {
             Sleep(2000);
             return 0;
         }
-        if (argc == 2 && std::string_view{argv[1]} == "--fixture-launcher") return fixture_launcher();
-        require(argc == 2 && std::string_view{argv[1]} == "--entry-check", "test invocation");
+        if (arguments == std::vector<std::wstring>{L"--fixture-launcher"}) return fixture_launcher();
+        require(arguments == std::vector<std::wstring>{L"--entry-check"}, "test invocation");
         const TestDirectory fixture;
         check_errors();
         check_environment();

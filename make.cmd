@@ -44,14 +44,15 @@ call :do_build Debug || goto failure
 goto success
 
 :test
-call :do_configure || goto failure
+cmake -S . -B build -A x64 -DBUILD_TESTING=ON
+if errorlevel 1 goto failure
 call :do_build Debug || goto failure
 ctest --test-dir build -C Debug --output-on-failure --no-tests=error
 if errorlevel 1 goto failure
 goto success
 
 :analyze
-cmake -S . -B build-analysis -A x64 -DSTEAMFIX_ENABLE_CODE_ANALYSIS=ON
+cmake -S . -B build-analysis -A x64 -DBUILD_TESTING=ON -DSTEAMFIX_ENABLE_CODE_ANALYSIS=ON
 if errorlevel 1 goto failure
 cmake --build build-analysis --config Debug --parallel
 if errorlevel 1 goto failure
@@ -91,7 +92,7 @@ if defined help_exit (
 goto success
 
 :coverage
-cmake -S . -B build-coverage -A x64 -DSTEAMFIX_ENABLE_COVERAGE=ON
+cmake -S . -B build-coverage -A x64 -DBUILD_TESTING=ON -DSTEAMFIX_ENABLE_COVERAGE=ON
 if errorlevel 1 goto failure
 cmake --build build-coverage --config Debug --parallel
 if errorlevel 1 goto failure

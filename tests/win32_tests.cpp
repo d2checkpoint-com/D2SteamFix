@@ -33,6 +33,11 @@ bool check_handle_ownership() {
         steamfix::UniqueHandle original{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
         observed = original.get();
         steamfix::UniqueHandle moved{std::move(original)};
+        // C.64: UniqueHandle promises an empty source after a move. Verify that
+        // contract; this observation does not use the transferred resource.
+#ifdef _MSC_VER
+#pragma warning(suppress: 26800)
+#endif
         if (original.get() != nullptr || moved.get() != observed || !is_open(observed)) {
             std::cerr << "Moving a handle did not transfer ownership.\n";
             return false;
@@ -47,6 +52,10 @@ bool check_handle_ownership() {
         steamfix::UniqueHandle assigned{CreateEventW(nullptr, TRUE, FALSE, nullptr)};
         const HANDLE replaced = assigned.get();
         assigned = std::move(moved);
+        // Inspect the explicitly supported empty moved-from state (C.64).
+#ifdef _MSC_VER
+#pragma warning(suppress: 26800)
+#endif
         if (moved.get() != nullptr || assigned.get() != observed || is_open(replaced)) {
             std::cerr << "Move assignment did not close the replaced handle.\n";
             return false;

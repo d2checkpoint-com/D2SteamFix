@@ -931,7 +931,6 @@ void remove_incomplete_state(const fs::path& path, const Logger& log) {
 }
 
 struct PreparedRecovery {
-    const RecoveryEntry* entry;
     OpenedTarget observed;
     OpenedTarget writable;
 };
@@ -939,19 +938,21 @@ struct PreparedRecovery {
 std::optional<PreparedRecovery> prepare_recovery_entry(const RecoveryEntry& entry,
                                                        const Logger& log) {
     const std::string shown = display_path(entry.backup.path);
-    std::optional<OpenedTarget> observed;
-    try {
-        observed = open_target(entry.backup.path, FILE_READ_ATTRIBUTES);
-    } catch (const UnsafeTarget& error) {
-        log.warn("skipped ACL recovery for unsafe renderer target: " + shown + ": " + error.what());
-        return std::nullopt;
-    } catch (const std::system_error& error) {
-        if (missing_error(static_cast<DWORD>(error.code().value()))) {
-            log.warn("skipped ACL recovery for missing renderer: " + shown);
+    auto observed = [&]() -> std::optional<OpenedTarget> {
+        try {
+            return open_target(entry.backup.path, FILE_READ_ATTRIBUTES);
+        } catch (const UnsafeTarget& error) {
+            log.warn("skipped ACL recovery for unsafe renderer target: " + shown + ": " + error.what());
             return std::nullopt;
+        } catch (const std::system_error& error) {
+            if (missing_error(static_cast<DWORD>(error.code().value()))) {
+                log.warn("skipped ACL recovery for missing renderer: " + shown);
+                return std::nullopt;
+            }
+            throw;
         }
-        throw;
-    }
+    }();
+    if (!observed) return std::nullopt;
     if (observed->identity != entry.identity) {
         log.warn("skipped ACL recovery because renderer identity changed: " + shown);
         return std::nullopt;
@@ -966,7 +967,7 @@ std::optional<PreparedRecovery> prepare_recovery_entry(const RecoveryEntry& entr
         throw std::runtime_error("renderer identity changed while ACL recovery was opening it: " + shown);
     }
     static_cast<void>(restoration_state(entry.backup, writable.handle.get()));
-    return PreparedRecovery{&entry, std::move(*observed), std::move(writable)};
+    return PreparedRecovery{std::move(*observed), std::move(writable)};
 }
 
 } // namespace
@@ -1007,8 +1008,10 @@ bool recover_pending(const fs::path& path, const Logger& log) {
                 "one or more renderer files could not be safely matched; recovery state was preserved");
         }
         size_t restored = 0;
-        for (const PreparedRecovery& target : prepared) {
-            if (restore_one(target.entry->backup, target.writable.handle.get())) ++restored;
+        // A skipped entry aborts above, so successful preflight preserves the
+        // journal order without borrowing pointers into the entries vector.
+        for (size_t index = 0; index < prepared.size(); ++index) {
+            if (restore_one(entries[index].backup, prepared[index].writable.handle.get())) ++restored;
         }
         const bool removed = elevation::remove_recovery_file(path);
         if (!removed) throw std::runtime_error("recovery file disappeared before cleanup");

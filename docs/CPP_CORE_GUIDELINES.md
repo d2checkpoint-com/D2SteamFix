@@ -70,7 +70,9 @@ signed application boundary.
 **P.7, E.2, E.12, F.6.** Repair rejects failed or unexpected process waits before
 acting. The application has a final nonthrowing exception boundary covering
 startup, logging, and even failure-message formatting. Stage-specific errors
-and the recovery journal remain available for diagnosis.
+and the recovery journal remain available for diagnosis. A missing optional
+32-bit renderer is distinguished from a filesystem inspection failure, including
+standard-library implementations that also set an error code for a missing path.
 
 **SF.10, SF.11, Con.1.** Headers and source files include their direct
 dependencies. New local bindings are immutable where their values do not

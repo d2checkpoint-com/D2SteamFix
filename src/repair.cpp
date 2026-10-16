@@ -431,8 +431,9 @@ void wait_for_repair(const HANDLE child, const fs::path& directory, const Logger
         const DWORD wait = wait_for_process(child, 500);
         if (wait == WAIT_OBJECT_0 && !steam_client_alive(directory)) {
             const auto now = Clock::now();
-            if (!quiet_since) quiet_since = now;
-            if (now - *quiet_since >= std::chrono::seconds(3)) {
+            const auto quiet_start = quiet_since.value_or(now);
+            quiet_since = quiet_start;
+            if (now - quiet_start >= std::chrono::seconds(3)) {
                 DWORD code = 0;
                 if (!GetExitCodeProcess(child, &code)) throw_win32(GetLastError());
                 log.info("Steam repair processes exited; original bootstrap status=" + std::to_string(code));
