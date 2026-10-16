@@ -8,6 +8,7 @@
 #include "steamfix/overlay.hpp"
 #include "steamfix/paths.hpp"
 #include "steamfix/process.hpp"
+#include "steamfix/repair.hpp"
 #include "steamfix/steam.hpp"
 #include "steamfix/ui.hpp"
 #include "steamfix/win32.hpp"
@@ -203,18 +204,6 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
     const Invocation invocation = validate_invocation(forwarded, app_id, game_id);
     log.info("validated launcher path: " + display_path(invocation.launcher));
     log.info("relevant App ID: 1085660");
-    check_overlay();
-
-    std::vector<std::pair<DWORD, std::wstring>> existing;
-    try {
-        existing = process::matching_in_dir(invocation.game_dir);
-    } catch (const std::exception& error) {
-        throw AppError(ExitCode::existing_session, "existing-session check", error.what());
-    }
-    if (!existing.empty()) {
-        throw AppError(ExitCode::existing_session, "existing-session check", existing_processes(existing));
-    }
-
     fs::path steam_directory;
     try {
         if (const std::optional<fs::path> inherited = elevation::inherited_steam_directory()) {
@@ -226,6 +215,26 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
         throw AppError(ExitCode::steam_discovery, "Steam discovery", error.what());
     }
     log.info("Steam directory: " + display_path(steam_directory));
+    std::error_code recovery_error;
+    const bool has_recovery = fs::exists(recovery, recovery_error);
+    if (recovery_error) {
+        throw AppError(ExitCode::overlay_protection, "ACL recovery lookup", recovery_error.message());
+    }
+    if (!has_recovery && repair::needed(steam_directory, log)) {
+        log.warn("renderer execute access is blocked without a recovery backup; offering Steam repair");
+        static_cast<void>(repair::run(invocation.game_dir, recovery, log));
+        return 0;
+    }
+    check_overlay();
+    std::vector<std::pair<DWORD, std::wstring>> existing;
+    try {
+        existing = process::matching_in_dir(invocation.game_dir);
+    } catch (const std::exception& error) {
+        throw AppError(ExitCode::existing_session, "existing-session check", error.what());
+    }
+    if (!existing.empty()) {
+        throw AppError(ExitCode::existing_session, "existing-session check", existing_processes(existing));
+    }
     const fs::path renderer64 = steam_directory / L"GameOverlayRenderer64.dll";
     require_regular_file(renderer64, ExitCode::steam_discovery, "renderer discovery",
                          "GameOverlayRenderer64.dll is missing or is not a regular file");
@@ -307,6 +316,10 @@ int run(const Logger& log, const std::vector<std::wstring>& forwarded, const fs:
 }
 
 std::wstring failure_message(const AppError& error) {
+    if (error.stage() == "Steam file repair") {
+        return L"Steam file repair could not finish.\n\n" + widen(error.detail()) +
+               L"\n\nSee steamfix.log in the Destiny 2 directory.";
+    }
     if (error.code() == ExitCode::invalid_invocation) return widen(error.detail());
     const wchar_t* launch_status = error.launcher_started()
         ? L"The Destiny 2 launcher was started." : L"Destiny 2 was not started.";
@@ -412,22 +425,14 @@ int entry() {
     log->info("startup; wrapper path: " + display_path(executable) +
               "; game directory: " + display_path(game_directory));
     try {
-        const SessionMutex mutex = session_mutex();
         const fs::path recovery = acl::recovery_path(game_directory);
         log->info("ACL recovery state path: " + display_path(recovery));
         if (forwarded.empty()) {
-            const auto existing = process::matching_in_dir(game_directory);
-            if (!existing.empty()) {
-                throw AppError(ExitCode::existing_session, "ACL recovery safety check",
-                               "close Destiny 2 before restoring renderer permissions: " +
-                               existing_processes(existing));
-            }
-            if (acl::recover_pending(recovery, *log)) {
-                log->info("restored renderer permissions from interrupted session; final exit status: 0");
-                ui::info(L"D2SteamFix restored the original Steam overlay permissions.");
-                return 0;
-            }
+            static_cast<void>(repair::run(game_directory, recovery, *log));
+            log->info("direct Steam repair finished; final exit status: 0");
+            return 0;
         }
+        const SessionMutex mutex = session_mutex();
         const int code = run(*log, forwarded, recovery);
         log->info("final exit status: " + std::to_string(code));
         return code;
