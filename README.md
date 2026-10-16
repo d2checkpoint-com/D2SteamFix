@@ -27,6 +27,14 @@ D2SteamFix supports normal and administrator launches. If Windows blocks a requi
 
 ![Steam Launch Options](https://static.d2checkpoint.com/steamfix_launch_options.png)
 
+## Interrupted Sessions
+
+D2SteamFix stores `steamfix.dat`, its backup of the original Steam overlay permissions, and `steamfix.log` in the Destiny 2 directory. Steam launches use the directory of the forwarded `destiny2launcher.exe` command, even if the working directory differs.
+
+If a session is interrupted, the next Steam launch reuses the existing backup and keeps the overlay blocked until Destiny 2 exits. It then restores the original permissions. Keep `steamfix.dat` until recovery succeeds; deleting it can leave the Steam overlay disabled in other games.
+
+With Destiny 2 closed, you can also open `steamfix.exe` directly from the game directory to restore a matching backup. If the saved renderer files or permissions no longer match, D2SteamFix preserves the backup and reports the mismatch.
+
 ## Building from Source
 
 ### Prerequisites

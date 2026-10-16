@@ -151,37 +151,6 @@ std::vector<std::pair<DWORD, std::wstring>> matching_in_dir(const fs::path& dire
     return result;
 }
 
-void wait_for_destiny_quiescence(const Logger& log) {
-    constexpr auto clean_interval = std::chrono::seconds(30);
-    std::optional<std::chrono::steady_clock::time_point> clear_since;
-    for (;;) {
-        std::optional<ProcessInfo> candidate;
-        for (const ProcessInfo& item : snapshot()) {
-            if (process_name_is(item.name, L"destiny2launcher.exe") ||
-                process_name_is(item.name, L"destiny2.exe")) {
-                candidate = item;
-                break;
-            }
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (candidate) {
-            throw std::runtime_error(
-                "a named Destiny process is still running; close it and retry: pid=" +
-                std::to_string(candidate->pid) + ", name=" + narrow(candidate->name));
-        } else {
-            if (!clear_since) {
-                clear_since = now;
-                log.info("pending ACL recovery found no named Destiny process; beginning 30-second "
-                         "safety interval");
-            } else if (now - *clear_since >= clean_interval) {
-                log.info("pending ACL recovery confirmed Destiny process quiescence");
-                return;
-            }
-        }
-        Sleep(500);
-    }
-}
-
 std::optional<int> monitor(const HANDLE child, const DWORD child_pid, const fs::path& game_dir,
                            const Logger& log) noexcept {
     using Key = std::pair<DWORD, std::uint64_t>;

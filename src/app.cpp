@@ -91,18 +91,6 @@ fs::path current_executable() {
     return fs::path(buffer);
 }
 
-fs::path current_directory() {
-    const DWORD needed = GetCurrentDirectoryW(0, nullptr);
-    if (needed == 0) throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
-    std::wstring buffer(needed, L'\0');
-    const DWORD written = GetCurrentDirectoryW(needed, buffer.data());
-    if (written == 0 || written >= needed) {
-        throw std::system_error(static_cast<int>(GetLastError()), std::system_category());
-    }
-    buffer.resize(written);
-    return fs::path(buffer);
-}
-
 class SessionMutex final {
 public:
     explicit SessionMutex(UniqueHandle handle) : handle_(std::move(handle)) {}
@@ -323,7 +311,7 @@ std::wstring failure_message(const AppError& error) {
     const wchar_t* launch_status = error.launcher_started()
         ? L"The Destiny 2 launcher was started." : L"Destiny 2 was not started.";
     return L"D2SteamFix failed during " + widen(error.stage()) + L":\n\n" + widen(error.detail()) +
-           L"\n\nSee steamfix.log in the current working directory.\n\n" + launch_status;
+           L"\n\nSee steamfix.log in the Destiny 2 directory.\n\n" + launch_status;
 }
 
 bool validate_app_ids(const std::optional<std::wstring>& app_id,
@@ -335,13 +323,8 @@ bool validate_app_ids(const std::optional<std::wstring>& app_id,
     return (app_id && *app_id == L"1085660") || (game_id && *game_id == L"1085660");
 }
 
-Invocation validate_invocation(const std::vector<std::wstring>& args,
-                               const std::optional<std::wstring>& app_id,
-                               const std::optional<std::wstring>& game_id) {
-    if (args.empty()) {
-        throw AppError(ExitCode::invalid_invocation, "invalid invocation", narrow(invalid_message));
-    }
-    const fs::path raw(args.front());
+fs::path resolve_launcher(const std::wstring& argument) {
+    const fs::path raw(argument);
     if (!paths::name_is(raw, L"destiny2launcher.exe")) {
         throw AppError(ExitCode::validation, "command validation",
                        "the forwarded executable must be destiny2launcher.exe");
@@ -359,6 +342,16 @@ Invocation validate_invocation(const std::vector<std::wstring>& args,
         throw AppError(ExitCode::validation, "command validation",
                        "launcher is not a regular destiny2launcher.exe file");
     }
+    return launcher;
+}
+
+Invocation validate_invocation(const std::vector<std::wstring>& args,
+                               const std::optional<std::wstring>& app_id,
+                               const std::optional<std::wstring>& game_id) {
+    if (args.empty()) {
+        throw AppError(ExitCode::invalid_invocation, "invalid invocation", narrow(invalid_message));
+    }
+    const fs::path launcher = resolve_launcher(args.front());
     const fs::path game_dir = launcher.parent_path();
     if (game_dir.empty()) {
         throw AppError(ExitCode::validation, "command validation", "launcher has no containing directory");
@@ -393,54 +386,47 @@ int entry() {
                   L"\n\nDestiny 2 was not started.");
         return static_cast<int>(ExitCode::internal);
     }
-    fs::path cwd;
+    fs::path game_directory;
     try {
-        cwd = current_directory();
+        game_directory = forwarded.empty() ? executable.parent_path()
+                                            : resolve_launcher(forwarded.front()).parent_path();
+    } catch (const AppError& error) {
+        ui::error(failure_message(error));
+        return static_cast<int>(error.code());
     } catch (const std::exception& error) {
-        ui::error(L"D2SteamFix could not determine the current working directory for its log and "
+        ui::error(L"D2SteamFix could not determine the Destiny 2 directory for its log and "
                   L"recovery files.\n\n" + widen(error.what()) + L"\n\nDestiny 2 was not started.");
         return static_cast<int>(ExitCode::log_initialization);
     }
     std::unique_ptr<Logger> log;
     try {
-        log = std::make_unique<Logger>(cwd / L"steamfix.log");
+        log = std::make_unique<Logger>(game_directory / L"steamfix.log");
     } catch (const elevation::Cancelled&) {
         return 0;
     } catch (const std::exception& error) {
-        ui::error(L"D2SteamFix could not open steamfix.log in the current working directory. "
-                  L"Ensure the working directory is writable.\n\n" + widen(error.what()) +
+        ui::error(L"D2SteamFix could not open steamfix.log in the Destiny 2 directory. "
+                  L"Ensure the game directory is writable.\n\n" + widen(error.what()) +
                   L"\n\nDestiny 2 was not started.");
         return static_cast<int>(ExitCode::log_initialization);
     }
     log->info("startup; wrapper path: " + display_path(executable) +
-              "; current working directory: " + display_path(cwd));
+              "; game directory: " + display_path(game_directory));
     try {
         const SessionMutex mutex = session_mutex();
-        const fs::path recovery = acl::recovery_path(cwd);
+        const fs::path recovery = acl::recovery_path(game_directory);
         log->info("ACL recovery state path: " + display_path(recovery));
-        std::error_code recovery_error;
-        const bool recovery_exists = fs::exists(recovery, recovery_error);
-        if (recovery_error) {
-            throw AppError(ExitCode::overlay_protection, "ACL recovery safety check",
-                           display_path(recovery) + ": " + recovery_error.message());
-        }
-        if (recovery_exists) {
-            ui::info(L"D2SteamFix found interrupted permission recovery state.\n\n"
-                     L"Close Destiny 2 before continuing. After you select OK, D2SteamFix will "
-                     L"require 30 seconds with no Destiny process before restoring permissions.");
-            try {
-                process::wait_for_destiny_quiescence(*log);
-            } catch (const std::exception& error) {
-                throw AppError(ExitCode::overlay_protection, "ACL recovery safety check",
-                               "could not establish that Destiny is closed; recovery state was preserved: " +
-                               std::string(error.what()));
+        if (forwarded.empty()) {
+            const auto existing = process::matching_in_dir(game_directory);
+            if (!existing.empty()) {
+                throw AppError(ExitCode::existing_session, "ACL recovery safety check",
+                               "close Destiny 2 before restoring renderer permissions: " +
+                               existing_processes(existing));
             }
-        }
-        const bool recovered = acl::recover_pending(recovery, *log);
-        if (recovered && forwarded.empty()) {
-            throw AppError(ExitCode::invalid_invocation, "invalid invocation",
-                           narrow(L"D2SteamFix restored renderer permissions left by an interrupted session.\n\n") +
-                           narrow(invalid_message));
+            if (acl::recover_pending(recovery, *log)) {
+                log->info("restored renderer permissions from interrupted session; final exit status: 0");
+                ui::info(L"D2SteamFix restored the original Steam overlay permissions.");
+                return 0;
+            }
         }
         const int code = run(*log, forwarded, recovery);
         log->info("final exit status: " + std::to_string(code));
@@ -480,12 +466,12 @@ int entry() {
     } catch (const std::exception& error) {
         log->error("unexpected internal failure: " + std::string(error.what()) + "; helper exit code=19");
         ui::error(L"D2SteamFix encountered an unexpected internal failure.\n\nSee steamfix.log in the "
-                  L"current working directory.\n\nDestiny 2 was not started.");
+                  L"Destiny 2 directory.\n\nDestiny 2 was not started.");
         return static_cast<int>(ExitCode::internal);
     } catch (...) {
         log->error("unexpected internal failure; helper exit code=19");
         ui::error(L"D2SteamFix encountered an unexpected internal failure.\n\nSee steamfix.log in the "
-                  L"current working directory.\n\nDestiny 2 was not started.");
+                  L"Destiny 2 directory.\n\nDestiny 2 was not started.");
         return static_cast<int>(ExitCode::internal);
     }
 }

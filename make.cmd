@@ -44,7 +44,7 @@ goto success
 echo Removing build artifacts...
 cmake -E remove_directory "%CD%\build"
 if errorlevel 1 goto failure
-echo Runtime logs and the current-working-directory recovery journal are intentionally preserved.
+echo Runtime logs and the game-directory recovery journal are intentionally preserved.
 goto success
 
 :help
