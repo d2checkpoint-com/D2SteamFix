@@ -8,7 +8,7 @@ class Logger;
 
 namespace steamfix::repair {
 
-// Inspect the denial left by this program before accepting permissions as a new baseline.
+// Check effective execute access before accepting permissions as a new baseline.
 bool needed(const std::filesystem::path& steam_directory, const Logger& log);
 
 // Cancellation leaves applications, renderer files, and recovery state untouched.

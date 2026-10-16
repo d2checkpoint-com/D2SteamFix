@@ -205,7 +205,7 @@ bool steam_name(const std::wstring& name) noexcept {
 }
 
 bool inside_steam(const fs::path& image, const fs::path& directory) {
-    // Steam's web helper and service live in child directories, never in steamapps.
+    // Steam's client helpers live in child directories, never in steamapps.
     // Updating Steam may already have renamed or replaced a running image.
     fs::path parent = fs::weakly_canonical(image.parent_path());
     for (unsigned depth = 0; depth < 8; ++depth) {
@@ -225,6 +225,23 @@ bool shared_steam_service(const fs::path& image) {
         if (FAILED(SHGetFolderPathW(nullptr, folder, nullptr, SHGFP_TYPE_CURRENT, directory.data()))) continue;
         const fs::path expected = fs::path(directory.data()) / L"Steam" / L"SteamService.exe";
         if (paths::equal_windows(image, expected)) return true;
+    }
+    return false;
+}
+
+bool steam_process(const fs::path& image, const fs::path& selected_directory) {
+    if (inside_steam(image, selected_directory) || shared_steam_service(image)) return true;
+    // Close Steam clients from other installations too, as repair promises to
+    // close Steam before replacing files. Verify the installation by its client.
+    fs::path parent = fs::weakly_canonical(image.parent_path());
+    for (unsigned depth = 0; depth < 8; ++depth) {
+        if (paths::name_is(parent, L"steamapps")) return false;
+        const DWORD attributes = GetFileAttributesW((parent / L"steam.exe").c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0) return true;
+        const fs::path next = parent.parent_path();
+        if (next == parent) break;
+        parent = next;
     }
     return false;
 }
@@ -262,8 +279,7 @@ std::vector<Termination> prepare_shutdown(const fs::path& steam_directory) {
             if (WaitForSingleObject(handle.get(), 0) == WAIT_OBJECT_0) continue;
             const fs::path image = process::image_path(handle.get());
             if (!paths::name_is(image, candidate.name)) continue;
-            if (!destiny_name(candidate.name) && !inside_steam(image, steam_directory) &&
-                !shared_steam_service(image)) continue;
+            if (!destiny_name(candidate.name) && !steam_process(image, steam_directory)) continue;
             result.push_back({std::move(handle), candidate});
         } catch (const std::system_error& error) {
             if (static_cast<DWORD>(error.code().value()) == ERROR_INVALID_PARAMETER) continue;

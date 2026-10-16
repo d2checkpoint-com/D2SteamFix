@@ -41,7 +41,7 @@ Double-click `steamfix.exe` in the Destiny 2 directory to repair Steam's overlay
 
 The dialog explains that Steam and Destiny 2 will close so Steam can repair its files. After you continue and approve any required Windows permission prompt, D2SteamFix closes those applications, removes `GameOverlayRenderer64.dll` and `GameOverlayRenderer.dll`, and starts Steam with `-forcesteamupdate -forcepackagedownload -exitsteam`. If Steam cannot be located, select its `steam.exe` in the file picker.
 
-After Steam exits and the repaired files are verified, D2SteamFix removes `steamfix.dat` and any `.tmp` or `.old` recovery files from the game directory, keeps all logs, and exits. Start Steam again when you are ready to play. Cancelling before repair leaves the files and applications unchanged. If repair fails, recovery records are retained for diagnosis.
+After Steam exits and the repaired files are verified, D2SteamFix removes `steamfix.dat` and any `.tmp` or `.old` recovery files from the game directory, keeps all logs, and exits. Start Steam again when you are ready to play. Cancelling before repair leaves the files and applications unchanged. Recovery cleanup runs only after the repaired files are verified.
 
 ## Building from Source
 
