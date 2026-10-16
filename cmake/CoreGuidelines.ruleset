@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RuleSet Name="D2SteamFix Core Guidelines" Description="Focused resource, initialization, and lifetime checks; manual review covers the remaining guidelines." ToolsVersion="10.0">
+  <Rules AnalyzerId="Microsoft.Analyzers.NativeCodeAnalysis" RuleNamespace="Microsoft.Rules.Native">
+    <!-- R.11: avoid explicit new/delete; C.21: complete special members. -->
+    <Rule Id="C26409" Action="Error" />
+    <Rule Id="C26432" Action="Error" />
+    <!-- CP.44: name RAII objects. -->
+    <Rule Id="C26444" Action="Error" />
+    <!-- Lifetime.1: do not dereference invalid pointers. -->
+    <Rule Id="C26486" Action="Error" />
+    <Rule Id="C26487" Action="Error" />
+    <Rule Id="C26489" Action="Error" />
+    <!-- ES.20 / Type.5 / Type.6: initialize objects and members. -->
+    <Rule Id="C26494" Action="Error" />
+    <Rule Id="C26495" Action="Error" />
+    <!-- ES.56 and Lifetime.1: avoid moved-from and dangling values. -->
+    <Rule Id="C26800" Action="Error" />
+    <Rule Id="C26815" Action="Error" />
+    <Rule Id="C26816" Action="Error" />
+  </Rules>
+</RuleSet>

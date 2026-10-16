@@ -13,7 +13,7 @@ jobs:
   build:
     name: Windows x64 (${{ matrix.configuration }})
     runs-on: windows-2022
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -37,10 +37,33 @@ jobs:
           }
 
       - name: Configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        run: |
+          $coverage = if ('${{ matrix.configuration }}' -eq 'Debug') { 'ON' } else { 'OFF' }
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DSTEAMFIX_ENABLE_CODE_ANALYSIS=ON "-DSTEAMFIX_ENABLE_COVERAGE=$coverage"
 
       - name: Build
         run: cmake --build build --config ${{ matrix.configuration }} --parallel
+
+      - name: Test
+        if: matrix.configuration != 'Debug'
+        run: ctest --test-dir build -C ${{ matrix.configuration }} --output-on-failure --no-tests=error
+
+      - name: Install coverage tool
+        if: matrix.configuration == 'Debug'
+        run: choco install opencppcoverage --version 0.9.9.0 --yes --no-progress
+
+      - name: Test with production line coverage
+        id: coverage
+        if: matrix.configuration == 'Debug'
+        run: ./cmake/RunCoverage.ps1 -BuildDirectory build
+
+      - name: Upload coverage report
+        if: always() && matrix.configuration == 'Debug' && steps.coverage.outcome != 'skipped'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: steamfix-windows-x64-coverage
+          path: build/coverage/
+          if-no-files-found: error
 
       - name: Upload executable
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

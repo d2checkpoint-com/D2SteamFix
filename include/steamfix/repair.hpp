@@ -1,4 +1,5 @@
-#pragma once
+#ifndef STEAMFIX_REPAIR_HPP
+#define STEAMFIX_REPAIR_HPP
 
 #include <filesystem>
 
@@ -16,3 +17,5 @@ bool run(const std::filesystem::path& game_directory,
          const std::filesystem::path& recovery_path, const Logger& log);
 
 } // namespace steamfix::repair
+
+#endif // STEAMFIX_REPAIR_HPP

@@ -4,21 +4,22 @@
 #include <tlhelp32.h>
 
 #include <cwchar>
+#include <system_error>
 
 namespace steamfix::overlay {
 namespace {
 
-constexpr unsigned max_snapshot_attempts = 8;
+constexpr int max_snapshot_attempts = 8;
 
 UniqueHandle module_snapshot() {
     DWORD error = ERROR_SUCCESS;
-    for (unsigned attempt = 0; attempt < max_snapshot_attempts; ++attempt) {
-        HANDLE raw = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
+    for (int attempt = 0; attempt < max_snapshot_attempts; ++attempt) {
+        const HANDLE raw = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32,
                                               GetCurrentProcessId());
         if (raw != INVALID_HANDLE_VALUE) return UniqueHandle(raw);
         error = GetLastError();
         if (error != ERROR_BAD_LENGTH) break;
-        if (attempt + 1U < max_snapshot_attempts) Sleep(1);
+        if (attempt + 1 < max_snapshot_attempts) Sleep(1);
     }
     throw std::system_error(static_cast<int>(error), std::system_category());
 }
@@ -26,7 +27,7 @@ UniqueHandle module_snapshot() {
 } // namespace
 
 std::optional<std::filesystem::path> loaded_renderer() {
-    UniqueHandle snapshot = module_snapshot();
+    const UniqueHandle snapshot = module_snapshot();
     MODULEENTRY32W entry{};
     entry.dwSize = sizeof(entry);
     if (!Module32FirstW(snapshot.get(), &entry)) {

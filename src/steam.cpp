@@ -6,11 +6,13 @@
 
 #include <windows.h>
 
-#include <algorithm>
 #include <cstddef>
+#include <exception>
 #include <filesystem>
 #include <sstream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <vector>
 
@@ -21,10 +23,12 @@ namespace {
 
 class RegistryKey {
 public:
-    explicit RegistryKey(HKEY key) : key_(key) {}
-    ~RegistryKey() { if (key_ != nullptr) RegCloseKey(key_); }
+    explicit RegistryKey(HKEY key) noexcept : key_(key) {}
+    ~RegistryKey() noexcept { if (key_ != nullptr) RegCloseKey(key_); }
     RegistryKey(const RegistryKey&) = delete;
     RegistryKey& operator=(const RegistryKey&) = delete;
+    RegistryKey(RegistryKey&&) = delete;
+    RegistryKey& operator=(RegistryKey&&) = delete;
     [[nodiscard]] HKEY get() const noexcept { return key_; }
 private:
     HKEY key_;
@@ -34,10 +38,10 @@ std::wstring registry_string(const wchar_t* name) {
     HKEY raw = nullptr;
     LSTATUS status = RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Valve\\Steam", 0, KEY_READ, &raw);
     if (status != ERROR_SUCCESS) throw std::system_error(static_cast<int>(status), std::system_category());
-    RegistryKey key(raw);
+    const RegistryKey key(raw);
     constexpr DWORD allowed_types = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
     constexpr DWORD max_registry_bytes = 128U * 1024U;
-    for (unsigned attempt = 0; attempt < 4; ++attempt) {
+    for (int attempt = 0; attempt < 4; ++attempt) {
         DWORD type = 0;
         DWORD bytes = 0;
         status = RegGetValueW(key.get(), nullptr, name, allowed_types, &type, nullptr, &bytes);
@@ -47,7 +51,7 @@ std::wstring registry_string(const wchar_t* name) {
         if (bytes == 0 || bytes > max_registry_bytes || bytes % sizeof(wchar_t) != 0) {
             throw std::runtime_error("Steam registry value has an invalid string size");
         }
-        std::vector<wchar_t> buffer(static_cast<size_t>(bytes / sizeof(wchar_t)) + 1U, L'\0');
+        std::vector<wchar_t> buffer(static_cast<std::size_t>(bytes / sizeof(wchar_t)) + 1U, L'\0');
         status = RegGetValueW(key.get(), nullptr, name, allowed_types, &type, buffer.data(), &bytes);
         if (status == ERROR_MORE_DATA) continue;
         if (status != ERROR_SUCCESS) {
@@ -59,13 +63,12 @@ std::wstring registry_string(const wchar_t* name) {
         if (bytes > buffer.size() * sizeof(wchar_t)) {
             throw std::runtime_error("Steam registry value returned an inconsistent string size");
         }
-        size_t units = bytes / sizeof(wchar_t);
-        while (units != 0 && buffer[units - 1] == L'\0') --units;
-        if (units == 0 || std::find(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(units),
-                                    L'\0') != buffer.begin() + static_cast<std::ptrdiff_t>(units)) {
+        std::wstring_view value(buffer.data(), bytes / sizeof(wchar_t));
+        while (!value.empty() && value.back() == L'\0') value.remove_suffix(1);
+        if (value.empty() || value.find(L'\0') != std::wstring_view::npos) {
             throw std::runtime_error("Steam registry value is empty or contains an embedded NUL");
         }
-        return std::wstring(buffer.data(), units);
+        return std::wstring(value);
     }
     throw std::runtime_error("Steam registry value changed repeatedly while it was being read");
 }

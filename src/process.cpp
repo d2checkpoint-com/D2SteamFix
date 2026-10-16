@@ -8,12 +8,17 @@
 
 #include <chrono>
 #include <cstdint>
+#include <cwchar>
+#include <exception>
 #include <limits>
 #include <map>
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <string>
+#include <system_error>
 #include <utility>
+#include <vector>
 
 namespace fs = std::filesystem;
 
@@ -31,7 +36,7 @@ class ReleaseState {
     using Clock = std::chrono::steady_clock;
 
     static constexpr auto launcher_exit_grace = std::chrono::seconds(30);
-    static constexpr unsigned exit_debounce_polls = 2;
+    static constexpr int exit_debounce_polls = 2;
 
     [[nodiscard]] bool observe(const bool launcher_alive, const bool game_alive,
                                const bool observation_reliable,
@@ -56,7 +61,7 @@ class ReleaseState {
                 return false;
             }
         }
-        if (absent_polls_ != std::numeric_limits<unsigned>::max()) ++absent_polls_;
+        if (absent_polls_ != std::numeric_limits<int>::max()) ++absent_polls_;
         return absent_polls_ >= exit_debounce_polls;
     }
 
@@ -67,12 +72,12 @@ class ReleaseState {
     }
 
     std::optional<Clock::time_point> launcher_exit_observed_at_;
-    unsigned absent_polls_ = 0;
+    int absent_polls_ = 0;
     bool game_observed_ = false;
 };
 
-void increment_saturated(unsigned& value) noexcept {
-    if (value != std::numeric_limits<unsigned>::max()) ++value;
+void increment_saturated(int& value) noexcept {
+    if (value != std::numeric_limits<int>::max()) ++value;
 }
 
 std::uint64_t creation_key(const HANDLE process) {
@@ -93,7 +98,7 @@ std::string process_message(const char* event, const std::wstring& name, const D
 }
 
 std::vector<ProcessInfo> snapshot() {
-    UniqueHandle handle(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    const UniqueHandle handle(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
     PROCESSENTRY32W entry{};
     entry.dwSize = sizeof(entry);
     if (!Process32FirstW(handle.get(), &entry)) {
@@ -160,10 +165,10 @@ std::optional<int> monitor(const HANDLE child, const DWORD child_pid, const fs::
     std::map<Key, Tracked> tracked;
     std::set<Key> previous;
     ReleaseState release;
-    unsigned failures = 0;
+    int failures = 0;
     bool candidate_uncertain = false;
-    unsigned candidate_uncertain_polls = 0;
-    unsigned child_wait_failures = 0;
+    int candidate_uncertain_polls = 0;
+    int child_wait_failures = 0;
     bool child_finished = false;
     std::optional<int> child_status;
 
@@ -191,7 +196,7 @@ std::optional<int> monitor(const HANDLE child, const DWORD child_pid, const fs::
                             log.info("original launcher handle became queryable again");
                         child_wait_failures = 0;
                         child_finished = true;
-                        child_status = static_cast<int>(status);
+                        child_status = windows_exit_status(status);
                     } else {
                         // The signaled process handle proves the launcher exited.
                         // UAC may provide a waitable handle without exit-code rights.
@@ -222,7 +227,7 @@ std::optional<int> monitor(const HANDLE child, const DWORD child_pid, const fs::
                     const bool game = process_name_is(item.name, L"destiny2.exe");
                     if (!launcher && !game) continue;
                     try {
-                        UniqueHandle handle = open_query(item.pid);
+                        const UniqueHandle handle = open_query(item.pid);
                         const fs::path path = image_path(handle.get());
                         if (!path.has_parent_path() ||
                             !paths::equal_windows(path.parent_path(), game_dir))
@@ -303,7 +308,7 @@ std::vector<DWORD> parent_chain() {
         parents[item.pid] = item.parent_pid;
     DWORD current = GetCurrentProcessId();
     std::vector<DWORD> result;
-    for (unsigned depth = 0; depth < 8; ++depth) {
+    for (int depth = 0; depth < 8; ++depth) {
         const auto found = parents.find(current);
         if (found == parents.end() || found->second == 0 || found->second == current) break;
         result.push_back(found->second);

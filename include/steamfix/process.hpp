@@ -1,4 +1,5 @@
-#pragma once
+#ifndef STEAMFIX_PROCESS_HPP
+#define STEAMFIX_PROCESS_HPP
 
 #include "steamfix/win32.hpp"
 
@@ -22,3 +23,5 @@ std::optional<int> monitor(HANDLE child, DWORD child_pid, const std::filesystem:
 std::vector<DWORD> parent_chain();
 
 } // namespace steamfix::process
+
+#endif // STEAMFIX_PROCESS_HPP

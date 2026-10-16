@@ -11,22 +11,27 @@
 
 #include <algorithm>
 #include <array>
+#include <concepts>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
+#include <string_view>
+#include <type_traits>
 
 namespace fs = std::filesystem;
 
 namespace steamfix::elevation {
 namespace {
-constexpr wchar_t helper_switch[] = L"--steamfix-permission-helper";
-constexpr wchar_t elevated_launch_switch[] = L"--steamfix-elevated-launch";
-std::optional<fs::path> accepted_steam_directory;
+constexpr std::wstring_view helper_switch = L"--steamfix-permission-helper";
+constexpr std::wstring_view elevated_launch_switch = L"--steamfix-elevated-launch";
 constexpr DWORD protocol = 0x31584653;
 constexpr DWORD max_path_units = 32767;
+constexpr DWORD pipe_timeout = 60000;
 constexpr DWORD file_limit = READ_CONTROL | WRITE_DAC | DELETE | FILE_READ_ATTRIBUTES |
                              FILE_READ_DATA | FILE_WRITE_DATA | FILE_APPEND_DATA |
                              FILE_WRITE_ATTRIBUTES | SYNCHRONIZE | GENERIC_READ | GENERIC_WRITE;
@@ -45,12 +50,24 @@ struct Request {
 };
 struct Response {
     DWORD error = ERROR_SUCCESS;
+    DWORD reserved = 0;
     std::uintptr_t handle = 0;
 };
 
+// The private helper is the same 64-bit executable. Keep its wire layout
+// explicit, including the former padding before the duplicated handle.
+static_assert(sizeof(Request) == 36 && sizeof(Response) == 16);
+static_assert(offsetof(Response, handle) == 8);
+static_assert(std::is_trivially_copyable_v<Request> && std::is_trivially_copyable_v<Response>);
+static_assert(std::has_unique_object_representations_v<Request> &&
+              std::has_unique_object_representations_v<Response>);
+
+template <typename T>
+concept WireObject = std::same_as<T, Request> || std::same_as<T, Response>;
+
 [[noreturn]] void fail(const DWORD error) {
     if (error == ERROR_CANCELLED) throw Cancelled();
-    throw std::system_error(static_cast<int>(error), std::system_category());
+    throw std::system_error(windows_exit_status(error), std::system_category());
 }
 
 fs::path executable_path(HANDLE process = nullptr) {
@@ -66,18 +83,25 @@ fs::path executable_path(HANDLE process = nullptr) {
     return fs::path(value);
 }
 
-void transfer(const HANDLE pipe, void* data, const size_t size, const bool writing, const DWORD timeout = 60000) {
-    auto* bytes = static_cast<std::byte*>(data);
-    size_t offset = 0;
+template <typename Byte, std::size_t Extent>
+    requires std::same_as<Byte, std::byte> || std::same_as<Byte, const std::byte>
+void transfer(const HANDLE pipe, const std::span<Byte, Extent> data, const DWORD timeout = pipe_timeout) {
     UniqueHandle event(CreateEventW(nullptr, TRUE, FALSE, nullptr));
-    while (offset < size) {
-        const DWORD requested = static_cast<DWORD>(std::min<size_t>(size - offset, MAXDWORD));
+    std::size_t offset = 0;
+    while (offset < data.size()) {
+        const auto bytes = data.subspan(offset);
+        const DWORD requested = static_cast<DWORD>(std::min<std::size_t>(bytes.size(), MAXDWORD));
         DWORD completed = 0;
         OVERLAPPED overlap{};
         overlap.hEvent = event.get();
         if (!ResetEvent(event.get())) fail(GetLastError());
-        const BOOL result = writing ? WriteFile(pipe, bytes + offset, requested, &completed, &overlap)
-                                    : ReadFile(pipe, bytes + offset, requested, &completed, &overlap);
+        const BOOL result = [&] {
+            if constexpr (std::is_const_v<Byte>) {
+                return WriteFile(pipe, bytes.data(), requested, &completed, &overlap);
+            } else {
+                return ReadFile(pipe, bytes.data(), requested, &completed, &overlap);
+            }
+        }();
         if (!result) {
             if (GetLastError() != ERROR_IO_PENDING) fail(GetLastError());
             const DWORD waited = WaitForSingleObject(event.get(), timeout);
@@ -91,19 +115,20 @@ void transfer(const HANDLE pipe, void* data, const size_t size, const bool writi
             if (!GetOverlappedResult(pipe, &overlap, &completed, FALSE)) fail(GetLastError());
         }
         if (completed == 0) fail(ERROR_BROKEN_PIPE);
+        if (completed > requested) fail(ERROR_INVALID_DATA);
         offset += completed;
     }
 }
 
-template <typename T>
+template <WireObject T>
 void write_object(const HANDLE pipe, const T& object) {
-    transfer(pipe, const_cast<T*>(&object), sizeof(object), true);
+    transfer(pipe, std::as_bytes(std::span{&object, 1}));
 }
 
-template <typename T>
-T read_object(const HANDLE pipe, const DWORD timeout = 60000) {
+template <WireObject T>
+T read_object(const HANDLE pipe, const DWORD timeout = pipe_timeout) {
     T result{};
-    transfer(pipe, &result, sizeof(result), false, timeout);
+    transfer(pipe, std::as_writable_bytes(std::span{&result, 1}), timeout);
     return result;
 }
 
@@ -119,8 +144,13 @@ std::vector<std::byte> token_user(const HANDLE process) {
     return result;
 }
 
-PSID user_sid(std::vector<std::byte>& user) {
-    return reinterpret_cast<TOKEN_USER*>(user.data())->User.Sid;
+PSID user_sid(const std::vector<std::byte>& user) {
+    if (user.size() < sizeof(TOKEN_USER)) fail(ERROR_INVALID_DATA);
+    TOKEN_USER information{};
+    // GetTokenInformation places a native header followed by its SID in the
+    // byte buffer. Copy the header instead of dereferencing byte storage as T.
+    std::memcpy(&information, user.data(), sizeof(information));
+    return information.User.Sid;
 }
 
 std::wstring sid_string(PSID sid) {
@@ -128,23 +158,6 @@ std::wstring sid_string(PSID sid) {
     if (!ConvertSidToStringSidW(sid, &text)) fail(GetLastError());
     LocalMemory memory(text);
     return text;
-}
-
-void enable_privilege(const wchar_t* name) {
-    HANDLE raw = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &raw)) {
-        fail(GetLastError());
-    }
-    const UniqueHandle token(raw);
-    TOKEN_PRIVILEGES privileges{};
-    privileges.PrivilegeCount = 1;
-    if (!LookupPrivilegeValueW(nullptr, name, &privileges.Privileges[0].Luid)) {
-        fail(GetLastError());
-    }
-    privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-    SetLastError(ERROR_SUCCESS);
-    if (!AdjustTokenPrivileges(token.get(), FALSE, &privileges, 0, nullptr, nullptr) ||
-        GetLastError() != ERROR_SUCCESS) fail(GetLastError());
 }
 
 class ScopedPrivilege final {
@@ -162,23 +175,34 @@ public:
         if (!AdjustTokenPrivileges(token_.get(), FALSE, &requested, sizeof(previous_), &previous_, &returned) ||
             GetLastError() != ERROR_SUCCESS) fail(GetLastError());
     }
-    ~ScopedPrivilege() {
+    ~ScopedPrivilege() noexcept {
         const DWORD saved_error = GetLastError();
         AdjustTokenPrivileges(token_.get(), FALSE, &previous_, 0, nullptr, nullptr);
+        token_.reset();
         SetLastError(saved_error);
     }
     ScopedPrivilege(const ScopedPrivilege&) = delete;
     ScopedPrivilege& operator=(const ScopedPrivilege&) = delete;
+    ScopedPrivilege(ScopedPrivilege&&) = delete;
+    ScopedPrivilege& operator=(ScopedPrivilege&&) = delete;
 private:
     UniqueHandle token_;
     TOKEN_PRIVILEGES previous_{};
 };
+
+std::mutex& privilege_mutex() {
+    // Token privileges belong to the process. Keep save/restore scopes from
+    // overlapping across callers, even when they request the same privilege.
+    static std::mutex mutex;
+    return mutex;
+}
 
 UniqueHandle process_with_debug_retry(const DWORD access, const DWORD pid) {
     HANDLE raw = OpenProcess(access, FALSE, pid);
     if (raw != nullptr) return UniqueHandle(raw);
     const DWORD error = GetLastError();
     if (!permission_denied(error)) fail(error);
+    const std::lock_guard privilege_lock(privilege_mutex());
     const ScopedPrivilege privilege(SE_DEBUG_NAME);
     raw = OpenProcess(access, FALSE, pid);
     if (raw == nullptr) fail(GetLastError());
@@ -267,22 +291,36 @@ UniqueHandle checked_file(const fs::path& path, const DWORD access, const DWORD 
     if (final_path.starts_with(L"\\\\?\\")) final_path.erase(0, 4);
     expected = fs::path(expected).lexically_normal().native();
     final_path = fs::path(final_path).lexically_normal().native();
+    if (expected.size() > static_cast<std::size_t>(std::numeric_limits<int>::max())) fail(ERROR_BAD_PATHNAME);
     if (CompareStringOrdinal(expected.c_str(), static_cast<int>(expected.size()), final_path.c_str(),
                              static_cast<int>(final_path.size()), TRUE) != CSTR_EQUAL) fail(ERROR_BAD_PATHNAME);
     return file;
 }
 
-void rename_without_replacement(const HANDLE file, const fs::path& target) {
+std::vector<std::byte> rename_information(const fs::path& target) {
     std::wstring destination = target.native();
     if (destination.starts_with(L"\\\\?\\")) destination.erase(0, 4);
-    const size_t name_bytes = destination.size() * sizeof(wchar_t);
-    std::vector<std::byte> storage(offsetof(FILE_RENAME_INFO, FileName) + name_bytes);
-    auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(storage.data());
-    rename->ReplaceIfExists = FALSE;
-    rename->RootDirectory = nullptr;
-    rename->FileNameLength = static_cast<DWORD>(name_bytes);
-    std::memcpy(rename->FileName, destination.data(), name_bytes);
-    if (!SetFileInformationByHandle(file, FileRenameInfo, rename,
+    constexpr std::size_t header_size = offsetof(FILE_RENAME_INFO, FileName);
+    constexpr std::size_t terminator_size = sizeof(wchar_t);
+    if (destination.size() > (MAXDWORD - header_size - terminator_size) / sizeof(wchar_t)) fail(ERROR_BAD_PATHNAME);
+    const std::size_t name_bytes = destination.size() * sizeof(wchar_t);
+    const DWORD length = static_cast<DWORD>(name_bytes);
+    std::vector<std::byte> storage(std::max(sizeof(FILE_RENAME_INFO), header_size + name_bytes + terminator_size));
+    // Win32 uses zero for ReplaceIfExists=false and RootDirectory=nullptr.
+    // Keep their entire native header, including union and alignment bytes,
+    // zeroed instead of copying indeterminate C++ structure padding into it.
+    std::memcpy(std::span{storage}.subspan(offsetof(FILE_RENAME_INFO, FileNameLength), sizeof(length)).data(),
+                &length, sizeof(length));
+    std::ranges::copy(std::as_bytes(std::span{destination}),
+                      std::span{storage}.subspan(header_size, name_bytes).begin());
+    // SetFileInformationByHandle also uses the trailing NUL when converting
+    // the absolute DOS path, although FileNameLength excludes that terminator.
+    return storage;
+}
+
+void rename_without_replacement(const HANDLE file, const fs::path& target) {
+    std::vector<std::byte> storage = rename_information(target);
+    if (!SetFileInformationByHandle(file, FileRenameInfo, storage.data(),
                                     static_cast<DWORD>(storage.size()))) fail(GetLastError());
 }
 
@@ -310,12 +348,15 @@ UniqueHandle privileged_file(const Request& request, const fs::path& path, PSID 
     }
     if (!journal && !log && (request.access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA |
                                        FILE_WRITE_ATTRIBUTES)) != 0) fail(ERROR_ACCESS_DENIED);
+    const std::lock_guard privilege_lock(privilege_mutex());
+    std::optional<ScopedPrivilege> backup;
+    std::optional<ScopedPrivilege> restore;
     PSECURITY_DESCRIPTOR descriptor = nullptr;
     SECURITY_ATTRIBUTES security{sizeof(security), nullptr, FALSE};
     // A credential prompt may use a different administrator account. The backup
     // remains owned/readable by its originating user, who encrypts it with DPAPI.
     if (request.creation == CREATE_NEW || (log && request.creation == OPEN_ALWAYS)) {
-        enable_privilege(SE_RESTORE_NAME);
+        restore.emplace(SE_RESTORE_NAME);
         const std::wstring sid = sid_string(originator);
         const std::wstring sddl = L"O:" + sid + L"D:P(A;;FA;;;" + sid + L")(A;;FA;;;SY)";
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -327,8 +368,8 @@ UniqueHandle privileged_file(const Request& request, const fs::path& path, PSID 
     if (journal || log) {
         // A different administrator may approve UAC. Backup semantics let the
         // helper open the originating user's private journal without adding an ACE.
-        enable_privilege(SE_BACKUP_NAME);
-        enable_privilege(SE_RESTORE_NAME);
+        backup.emplace(SE_BACKUP_NAME);
+        if (!restore) restore.emplace(SE_RESTORE_NAME);
         extra_flags = FILE_FLAG_BACKUP_SEMANTICS;
     }
     UniqueHandle file = checked_file(path, request.access | READ_CONTROL, request.share,
@@ -348,12 +389,14 @@ bool oversized_log(const HANDLE file) {
 }
 
 bool rotate_existing_log(const fs::path& path, const bool privileged) {
+    std::optional<std::lock_guard<std::mutex>> privilege_lock;
     std::optional<ScopedPrivilege> backup;
     std::optional<ScopedPrivilege> restore;
     DWORD flags = FILE_FLAG_OPEN_REPARSE_POINT;
     if (privileged) {
         validate_path(path);
         if (!game_log(path)) fail(ERROR_ACCESS_DENIED);
+        privilege_lock.emplace(privilege_mutex());
         backup.emplace(SE_BACKUP_NAME);
         restore.emplace(SE_RESTORE_NAME);
         flags |= FILE_FLAG_BACKUP_SEMANTICS;
@@ -406,9 +449,9 @@ UniqueHandle privileged_process(const DWORD pid) {
     if (paths::name_is(image, L"steamservice.exe")) {
         constexpr std::array folders{CSIDL_PROGRAM_FILES_COMMONX86, CSIDL_PROGRAM_FILES_COMMON};
         for (const int folder : folders) {
-            wchar_t directory[MAX_PATH]{};
-            if (SUCCEEDED(SHGetFolderPathW(nullptr, folder, nullptr, SHGFP_TYPE_CURRENT, directory)) &&
-                paths::equal_windows(image, fs::path(directory) / L"Steam" / L"SteamService.exe")) return process;
+            std::array<wchar_t, MAX_PATH> directory{};
+            if (SUCCEEDED(SHGetFolderPathW(nullptr, folder, nullptr, SHGFP_TYPE_CURRENT, directory.data())) &&
+                paths::equal_windows(image, fs::path(directory.data()) / L"Steam" / L"SteamService.exe")) return process;
         }
     }
     if (steam) {
@@ -426,7 +469,7 @@ UniqueHandle privileged_process(const DWORD pid) {
 std::wstring read_path(const HANDLE pipe, const DWORD units) {
     if (units > max_path_units) fail(ERROR_INVALID_DATA);
     std::wstring value(units, L'\0');
-    transfer(pipe, value.data(), value.size() * sizeof(wchar_t), false);
+    transfer(pipe, std::as_writable_bytes(std::span{value}));
     return value;
 }
 
@@ -444,10 +487,20 @@ public:
         if (text.size() > max_path_units || second_text.size() > max_path_units) fail(ERROR_BAD_PATHNAME);
         request.path_units = static_cast<DWORD>(text.size());
         request.second_path_units = static_cast<DWORD>(second_text.size());
-        write_object(pipe_.get(), request);
-        transfer(pipe_.get(), const_cast<wchar_t*>(text.data()), text.size() * sizeof(wchar_t), true);
-        transfer(pipe_.get(), const_cast<wchar_t*>(second_text.data()), second_text.size() * sizeof(wchar_t), true);
-        const Response response = read_object<Response>(pipe_.get());
+        const Response response = [&] {
+            try {
+                write_object(pipe_.get(), request);
+                transfer(pipe_.get(), std::as_bytes(std::span{text}));
+                transfer(pipe_.get(), std::as_bytes(std::span{second_text}));
+                return read_object<Response>(pipe_.get());
+            } catch (...) {
+                // A partial exchange has lost its framing. Let the helper exit
+                // and obtain a new connection for a later independent request.
+                pipe_.reset();
+                helper_.reset();
+                throw;
+            }
+        }();
         if (response.error != ERROR_SUCCESS) fail(response.error);
         return response;
     }
@@ -455,9 +508,9 @@ private:
     void start() {
         GUID identifier{};
         if (FAILED(CoCreateGuid(&identifier))) fail(ERROR_GEN_FAILURE);
-        wchar_t guid[40]{};
-        if (StringFromGUID2(identifier, guid, static_cast<int>(std::size(guid))) == 0) fail(ERROR_GEN_FAILURE);
-        const std::wstring pipe_name = L"\\\\.\\pipe\\D2SteamFix-" + std::wstring(guid);
+        std::array<wchar_t, 40> guid{};
+        if (StringFromGUID2(identifier, guid.data(), static_cast<int>(guid.size())) == 0) fail(ERROR_GEN_FAILURE);
+        const std::wstring pipe_name = L"\\\\.\\pipe\\D2SteamFix-" + std::wstring(guid.data());
         std::vector<std::byte> user = token_user(GetCurrentProcess());
         const std::wstring sddl = L"D:P(A;;GA;;;" + sid_string(user_sid(user)) +
                                   L")(A;;GA;;;BA)(A;;GA;;;SY)";
@@ -481,17 +534,26 @@ private:
         const bool pending = !connecting && connection_error == ERROR_IO_PENDING;
         if (!pending && !SetEvent(connected.get())) fail(GetLastError());
         // Pending I/O owns overlap until it completes, including cancellation.
-        struct CancelConnection {
-            HANDLE pipe;
-            OVERLAPPED* overlap;
-            bool pending;
-            ~CancelConnection() {
-                if (!pending) return;
-                CancelIoEx(pipe, overlap);
+        class CancelConnection final {
+        public:
+            CancelConnection(HANDLE pipe, OVERLAPPED& overlap, bool pending) noexcept
+                : pipe_(pipe), overlap_(overlap), pending_(pending) {}
+            ~CancelConnection() noexcept {
+                if (!pending_) return;
+                CancelIoEx(pipe_, &overlap_);
                 DWORD ignored = 0;
-                GetOverlappedResult(pipe, overlap, &ignored, TRUE);
+                GetOverlappedResult(pipe_, &overlap_, &ignored, TRUE);
             }
-        } connection{listener.get(), &overlap, pending};
+            CancelConnection(const CancelConnection&) = delete;
+            CancelConnection& operator=(const CancelConnection&) = delete;
+            CancelConnection(CancelConnection&&) = delete;
+            CancelConnection& operator=(CancelConnection&&) = delete;
+            void complete() noexcept { pending_ = false; }
+        private:
+            HANDLE pipe_;
+            OVERLAPPED& overlap_;
+            bool pending_;
+        } connection{listener.get(), overlap, pending};
         const fs::path executable = executable_path();
         std::wstring parameters;
         command_line::append_quoted(parameters, helper_switch);
@@ -511,14 +573,14 @@ private:
         }
         UniqueHandle helper(execute.hProcess);
         const std::array waits{connected.get(), helper.get()};
-        const DWORD waited = WaitForMultipleObjects(static_cast<DWORD>(waits.size()), waits.data(), FALSE, 60000);
+        const DWORD waited = WaitForMultipleObjects(static_cast<DWORD>(waits.size()), waits.data(), FALSE, pipe_timeout);
         if (waited != WAIT_OBJECT_0) {
             CancelIoEx(listener.get(), &overlap);
             fail(waited == WAIT_TIMEOUT ? ERROR_TIMEOUT : ERROR_BROKEN_PIPE);
         }
         DWORD transferred = 0;
         if (pending && !GetOverlappedResult(listener.get(), &overlap, &transferred, FALSE)) fail(GetLastError());
-        connection.pending = false;
+        connection.complete();
         ULONG client = 0;
         if (!GetNamedPipeClientProcessId(listener.get(), &client) || client != GetProcessId(helper.get())) {
             fail(ERROR_ACCESS_DENIED);
@@ -587,6 +649,9 @@ int helper(const DWORD parent_pid, const std::wstring& pipe_name) {
                 check_owner(opened.get(), user_sid(user));
                 // Rename the validated source handle. Reopening by pathname
                 // would lose the private-journal access granted by backup semantics.
+                const std::lock_guard privilege_lock(privilege_mutex());
+                const ScopedPrivilege backup(SE_BACKUP_NAME);
+                const ScopedPrivilege restore(SE_RESTORE_NAME);
                 rename_without_replacement(opened.get(), second);
                 opened.reset();
             } else {
@@ -721,8 +786,8 @@ std::optional<int> dispatch_helper(const std::vector<std::wstring>& arguments) {
     }
 }
 
-void accept_elevated_launch(std::vector<std::wstring>& arguments) {
-    if (arguments.empty() || arguments.front() != elevated_launch_switch) return;
+std::optional<fs::path> accept_elevated_launch(std::vector<std::wstring>& arguments) {
+    if (arguments.empty() || arguments.front() != elevated_launch_switch) return std::nullopt;
     if (arguments.size() < 4 || !is_elevated()) fail(ERROR_INVALID_PARAMETER);
     size_t consumed = 0;
     const unsigned long long value = std::stoull(arguments[1], &consumed);
@@ -735,15 +800,11 @@ void accept_elevated_launch(std::vector<std::wstring>& arguments) {
     if (!regular(steam_directory / L"steam.exe")) fail(ERROR_FILE_NOT_FOUND);
     // Steam's registry and environment may belong to the original account.
     // Only this authenticated private handoff can supply a discovery override.
-    accepted_steam_directory = steam_directory;
     // The complete forwarded command is independently validated by normal entry.
     if (!SetEnvironmentVariableW(L"SteamAppId", L"1085660") ||
         !SetEnvironmentVariableW(L"SteamGameId", L"1085660")) fail(GetLastError());
     arguments.erase(arguments.begin(), arguments.begin() + 3);
-}
-
-std::optional<fs::path> inherited_steam_directory() {
-    return accepted_steam_directory;
+    return steam_directory;
 }
 
 std::optional<int> relaunch_as_administrator(const std::vector<std::wstring>& arguments,
@@ -769,7 +830,7 @@ std::optional<int> relaunch_as_administrator(const std::vector<std::wstring>& ar
     if (waited != WAIT_OBJECT_0) fail(GetLastError());
     DWORD status = 0;
     if (!GetExitCodeProcess(child.get(), &status)) return std::nullopt;
-    return static_cast<int>(status);
+    return windows_exit_status(status);
 }
 
 bool launch_as_desktop_user(const fs::path& executable, const std::wstring& command_line,
@@ -799,9 +860,10 @@ bool launch_as_desktop_user(const fs::path& executable, const std::wstring& comm
     if (!DuplicateTokenEx(token.get(), TOKEN_ALL_ACCESS, nullptr, SecurityImpersonation,
                            TokenPrimary, &primary_raw)) return false;
     const UniqueHandle primary(primary_raw);
+    std::wstring desktop = L"winsta0\\default";
     STARTUPINFOW startup{};
     startup.cb = sizeof(startup);
-    startup.lpDesktop = const_cast<LPWSTR>(L"winsta0\\default");
+    startup.lpDesktop = desktop.data();
     // Both Windows process APIs may modify their command-line buffer even on
     // failure. Keep the caller's original available for its fallback launch.
     std::wstring mutable_command_line = command_line;

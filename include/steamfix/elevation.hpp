@@ -1,9 +1,13 @@
-#pragma once
+#ifndef STEAMFIX_ELEVATION_HPP
+#define STEAMFIX_ELEVATION_HPP
 
 #include "steamfix/win32.hpp"
 
 #include <filesystem>
+#include <memory>
 #include <optional>
+#include <stdexcept>
+#include <string>
 #include <system_error>
 #include <utility>
 #include <vector>
@@ -23,20 +27,31 @@ public:
     RelaunchRequired(DWORD error, std::filesystem::path directory, std::filesystem::path launcher,
                      std::filesystem::path steam_directory)
         : std::runtime_error("launcher requires administrator permission: " + windows_error(error)),
-          directory_(std::move(directory)), launcher_(std::move(launcher)),
-          steam_directory_(std::move(steam_directory)) {}
-    const std::filesystem::path& directory() const noexcept { return directory_; }
-    const std::filesystem::path& launcher() const noexcept { return launcher_; }
-    const std::filesystem::path& steam_directory() const noexcept { return steam_directory_; }
+          payload_(std::make_shared<const Payload>(std::move(directory), std::move(launcher),
+                                                   std::move(steam_directory))) {}
+    ~RelaunchRequired() noexcept override = default;
+    RelaunchRequired(const RelaunchRequired&) noexcept = default;
+    RelaunchRequired& operator=(const RelaunchRequired&) noexcept = default;
+    RelaunchRequired(RelaunchRequired&& other) noexcept
+        : RelaunchRequired(static_cast<const RelaunchRequired&>(other)) {}
+    RelaunchRequired& operator=(RelaunchRequired&& other) noexcept {
+        return *this = static_cast<const RelaunchRequired&>(other);
+    }
+    const std::filesystem::path& directory() const noexcept { return payload_->directory; }
+    const std::filesystem::path& launcher() const noexcept { return payload_->launcher; }
+    const std::filesystem::path& steam_directory() const noexcept { return payload_->steam_directory; }
 private:
-    std::filesystem::path directory_;
-    std::filesystem::path launcher_;
-    std::filesystem::path steam_directory_;
+    struct Payload {
+        std::filesystem::path directory;
+        std::filesystem::path launcher;
+        std::filesystem::path steam_directory;
+    };
+    std::shared_ptr<const Payload> payload_;
 };
 
-// Validate and strip the private elevated-coordinator prefix before normal entry.
-void accept_elevated_launch(std::vector<std::wstring>& arguments);
-std::optional<std::filesystem::path> inherited_steam_directory();
+// Validate and strip the private elevated-coordinator prefix before normal entry,
+// returning the authenticated Steam discovery override when one was supplied.
+std::optional<std::filesystem::path> accept_elevated_launch(std::vector<std::wstring>& arguments);
 std::optional<int> relaunch_as_administrator(const std::vector<std::wstring>& arguments,
                               const std::filesystem::path& directory,
                               const std::filesystem::path& steam_directory);
@@ -69,3 +84,5 @@ bool launch_as_desktop_user(const std::filesystem::path& executable,
                             PROCESS_INFORMATION& information);
 
 } // namespace steamfix::elevation
+
+#endif // STEAMFIX_ELEVATION_HPP

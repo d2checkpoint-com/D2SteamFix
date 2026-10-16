@@ -1,5 +1,7 @@
-#pragma once
+#ifndef STEAMFIX_ERROR_HPP
+#define STEAMFIX_ERROR_HPP
 
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -21,12 +23,19 @@ enum class ExitCode : int {
 class AppError final : public std::runtime_error {
 public:
     AppError(ExitCode code, std::string stage, std::string detail)
-        : std::runtime_error(stage + ": " + detail), code_(code), stage_(std::move(stage)),
-          detail_(std::move(detail)) {}
+        : std::runtime_error(stage + ": " + detail), code_(code),
+          context_(std::make_shared<const Context>(Context{std::move(stage), std::move(detail)})) {}
+    ~AppError() noexcept override = default;
+    AppError(const AppError&) noexcept = default;
+    AppError& operator=(const AppError&) noexcept = default;
+    AppError(AppError&& other) noexcept : AppError(static_cast<const AppError&>(other)) {}
+    AppError& operator=(AppError&& other) noexcept {
+        return *this = static_cast<const AppError&>(other);
+    }
 
     [[nodiscard]] ExitCode code() const noexcept { return code_; }
-    [[nodiscard]] const std::string& stage() const noexcept { return stage_; }
-    [[nodiscard]] const std::string& detail() const noexcept { return detail_; }
+    [[nodiscard]] const std::string& stage() const noexcept { return context_->stage; }
+    [[nodiscard]] const std::string& detail() const noexcept { return context_->detail; }
     [[nodiscard]] bool launcher_started() const noexcept { return launcher_started_; }
     AppError& after_launch() noexcept {
         launcher_started_ = true;
@@ -34,10 +43,16 @@ public:
     }
 
 private:
+    // Exception copies must not allocate, including copies made by exception_ptr.
+    struct Context {
+        std::string stage;
+        std::string detail;
+    };
     ExitCode code_;
-    std::string stage_;
-    std::string detail_;
+    std::shared_ptr<const Context> context_;
     bool launcher_started_ = false;
 };
 
 } // namespace steamfix
+
+#endif // STEAMFIX_ERROR_HPP
