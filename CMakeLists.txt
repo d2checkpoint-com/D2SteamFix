@@ -122,6 +122,7 @@ if(BUILD_TESTING)
     target_compile_features(overlay_fixture PRIVATE cxx_std_20)
     target_compile_options(overlay_fixture PRIVATE /W4 /WX /permissive- /EHsc /utf-8 /sdl)
     add_dependencies(runtime_tests overlay_fixture)
+    add_dependencies(app_tests overlay_fixture)
 
     if(STEAMFIX_ENABLE_COVERAGE)
         # Load every production translation unit in one Debug module. This keeps

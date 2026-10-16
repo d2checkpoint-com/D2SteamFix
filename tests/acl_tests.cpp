@@ -1,12 +1,110 @@
-// Keep the production implementation in this translation unit so its private
-// binary readers and recovery preflight run unchanged against real Win32 APIs.
-#include "../src/acl.cpp"
+// Load production dependencies before redirecting the three selected Win32
+// call sites in acl.cpp. Declarations and separately compiled modules stay real.
+#include "steamfix/acl.hpp"
+#include "steamfix/error.hpp"
+#include "steamfix/elevation.hpp"
+#include "steamfix/logging.hpp"
+#include "steamfix/paths.hpp"
+#include "steamfix/win32.hpp"
 
+#include <aclapi.h>
+#include <dpapi.h>
+
+#include <algorithm>
+#include <array>
 #include <concepts>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <exception>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <limits>
+#include <optional>
+#include <span>
+#include <stdexcept>
+#include <string>
 #include <string_view>
+#include <system_error>
+#include <type_traits>
+#include <utility>
+
+namespace acl_fault {
+
+struct Plan {
+    int write_failures_remaining = 0;
+    int flush_failures_remaining = 0;
+    std::array<int, 2> security_failure_calls{};
+    int write_failures = 0;
+    int flush_failures = 0;
+    int security_calls = 0;
+    int security_failures = 0;
+};
+
+// Each plan is borrowed only by the current test thread's bounded Scope.
+thread_local Plan* active_plan = nullptr;
+
+BOOL WINAPI write_file(const HANDLE file, const LPCVOID bytes, const DWORD length,
+                       const LPDWORD written, const LPOVERLAPPED overlap) {
+    if (active_plan != nullptr && active_plan->write_failures_remaining != 0) {
+        --active_plan->write_failures_remaining;
+        ++active_plan->write_failures;
+        if (written != nullptr) *written = 0;
+        SetLastError(ERROR_WRITE_FAULT);
+        return FALSE;
+    }
+    return ::WriteFile(file, bytes, length, written, overlap);
+}
+
+BOOL WINAPI flush_file(const HANDLE file) {
+    if (active_plan != nullptr && active_plan->flush_failures_remaining != 0) {
+        --active_plan->flush_failures_remaining;
+        ++active_plan->flush_failures;
+        SetLastError(ERROR_WRITE_FAULT);
+        return FALSE;
+    }
+    return ::FlushFileBuffers(file);
+}
+
+DWORD WINAPI set_security(const HANDLE handle, const SE_OBJECT_TYPE type,
+                          const SECURITY_INFORMATION information, const PSID owner,
+                          const PSID group, const PACL dacl, const PACL sacl) {
+    if (active_plan != nullptr) {
+        ++active_plan->security_calls;
+        for (const int failure_call : active_plan->security_failure_calls) {
+            if (active_plan->security_calls == failure_call) {
+                ++active_plan->security_failures;
+                return ERROR_WRITE_FAULT;
+            }
+        }
+    }
+    return ::SetSecurityInfo(handle, type, information, owner, group, dacl, sacl);
+}
+
+class Scope final {
+public:
+    explicit Scope(Plan& plan) noexcept : previous_(active_plan) { active_plan = &plan; }
+    ~Scope() noexcept { active_plan = previous_; }
+    Scope(const Scope&) = delete;
+    Scope& operator=(const Scope&) = delete;
+    Scope(Scope&&) = delete;
+    Scope& operator=(Scope&&) = delete;
+private:
+    Plan* previous_;
+};
+
+} // namespace acl_fault
+
+// Keep actual binary readers and ACL/recovery state transitions in the test TU.
+// With no active plan, every call below invokes the corresponding real API.
+#define WriteFile acl_fault::write_file
+#define FlushFileBuffers acl_fault::flush_file
+#define SetSecurityInfo acl_fault::set_security
+#include "../src/acl.cpp"
+#undef WriteFile
+#undef FlushFileBuffers
+#undef SetSecurityInfo
 
 namespace {
 namespace acl = steamfix::acl;
@@ -658,6 +756,107 @@ void state_file_and_neighbor_tests() {
     require(!acl::prepare_recovery_entry(entry, fixture.log), "unsafe Steam neighbor passed preflight");
 }
 
+void journal_write_failure_tests() {
+    for (const bool fail_flush : {false, true}) {
+        Fixture fixture;
+        const auto first = prepared_backup(fixture.renderer);
+        const auto second = prepared_backup(fixture.renderer32);
+        const auto first_bytes = file_bytes(fixture.renderer);
+        const auto second_bytes = file_bytes(fixture.renderer32);
+        const std::array targets{fixture.renderer, fixture.renderer32};
+        acl_fault::Plan plan;
+        if (fail_flush) plan.flush_failures_remaining = 1;
+        else plan.write_failures_remaining = 1;
+        {
+            const acl_fault::Scope faults(plan);
+            rejects<steamfix::AppError>([&] {
+                try {
+                    static_cast<void>(acl::Protection::apply(targets, fixture.state, fixture.log));
+                } catch (const steamfix::AppError& error) {
+                    require(error.stage() == "ACL recovery persistence",
+                            "journal fault failed outside persistence");
+                    throw;
+                }
+            }, "journal write/flush fault did not stop protection");
+        }
+        require(plan.write_failures == (fail_flush ? 0 : 1) &&
+                plan.flush_failures == (fail_flush ? 1 : 0) && plan.security_calls == 0,
+                "journal fault was not consumed before all renderer permission changes");
+        require(plan.write_failures_remaining == 0 && plan.flush_failures_remaining == 0,
+                "journal fault remained armed");
+        fs::path temporary = fixture.state;
+        temporary += L".tmp";
+        require(!fs::exists(fixture.state) && !fs::exists(temporary),
+                "failed journal I/O left an exclusively locked temporary file or committed journal");
+        acl::verify_restored(first.backup, first.handle.get());
+        acl::verify_restored(second.backup, second.handle.get());
+        require(file_bytes(fixture.renderer) == first_bytes && file_bytes(fixture.renderer32) == second_bytes,
+                "failed journal I/O changed renderer contents");
+
+        // A successful retry also proves cleanup released the old .tmp name and handle.
+        auto retried = acl::Protection::apply(targets, fixture.state, fixture.log);
+        acl::verify_denied(first.backup, first.handle.get());
+        acl::verify_denied(second.backup, second.handle.get());
+        retried.restore(fixture.log);
+        acl::verify_restored(first.backup, first.handle.get());
+        acl::verify_restored(second.backup, second.handle.get());
+        require(!fs::exists(fixture.state) && !fs::exists(temporary),
+                "retry after failed journal I/O retained recovery files");
+    }
+}
+
+void partial_denial_rollback_tests() {
+    for (const bool fail_rollback : {false, true}) {
+        Fixture fixture;
+        const auto first = prepared_backup(fixture.renderer);
+        const auto second = prepared_backup(fixture.renderer32);
+        const auto first_bytes = file_bytes(fixture.renderer);
+        const auto second_bytes = file_bytes(fixture.renderer32);
+        const std::array targets{fixture.renderer, fixture.renderer32};
+        acl_fault::Plan plan;
+        // In a fresh apply, calls 1 and 2 deny the first and second renderer.
+        // Call 3 restores the already-denied first renderer during rollback.
+        plan.security_failure_calls = {2, fail_rollback ? 3 : 0};
+        {
+            const acl_fault::Scope faults(plan);
+            rejects<steamfix::AppError>([&] {
+                try {
+                    static_cast<void>(acl::Protection::apply(targets, fixture.state, fixture.log));
+                } catch (const steamfix::AppError& error) {
+                    require(error.stage() == "renderer permission denial",
+                            "second denial fault failed outside denial rollback");
+                    throw;
+                }
+            }, "second renderer denial fault did not fail protection");
+        }
+        require(plan.security_calls == 3 && plan.security_failures == (fail_rollback ? 2 : 1),
+                "second denial and first rollback did not reach the intended finite faults");
+        acl::verify_restored(second.backup, second.handle.get());
+        fs::path temporary = fixture.state;
+        temporary += L".tmp";
+        require(!fs::exists(temporary), "denial rollback retained a temporary journal");
+        if (fail_rollback) {
+            acl::verify_denied(first.backup, first.handle.get());
+            require(fs::exists(fixture.state), "failed rollback discarded the original recovery journal");
+            const auto saved = acl::read_state(fixture.state);
+            require(saved.size() == 2 && saved[0].backup.descriptor == first.backup.descriptor &&
+                    saved[1].backup.descriptor == second.backup.descriptor &&
+                    saved[0].identity == first.identity && saved[1].identity == second.identity,
+                    "failed rollback did not preserve both original ACLs and identities");
+            require(acl::recover_pending(fixture.state, fixture.log),
+                    "real recovery could not finish the interrupted rollback");
+        } else {
+            acl::verify_restored(first.backup, first.handle.get());
+            require(!fs::exists(fixture.state), "successful denial rollback retained its journal");
+        }
+        acl::verify_restored(first.backup, first.handle.get());
+        acl::verify_restored(second.backup, second.handle.get());
+        require(!fs::exists(fixture.state) && file_bytes(fixture.renderer) == first_bytes &&
+                file_bytes(fixture.renderer32) == second_bytes,
+                "rollback/recovery left a journal or changed renderer contents");
+    }
+}
+
 } // namespace
 
 int main() {
@@ -668,6 +867,8 @@ int main() {
         protection_lifecycle_tests();
         pending_recovery_tests();
         state_file_and_neighbor_tests();
+        journal_write_failure_tests();
+        partial_denial_rollback_tests();
         std::cout << "ACL tests passed: " << assertions << " assertions using real Win32 APIs.\n";
     } catch (const std::exception& error) {
         std::cerr << "ACL regression test failed after " << assertions << " assertions: "

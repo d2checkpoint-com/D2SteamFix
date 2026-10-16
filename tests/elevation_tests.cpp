@@ -19,14 +19,21 @@ namespace elevation_fault {
 BOOL WINAPI shell_execute(SHELLEXECUTEINFOW* execute);
 BOOL WINAPI token_information(HANDLE token, TOKEN_INFORMATION_CLASS information_class,
                               LPVOID information, DWORD bytes, PDWORD returned);
+HANDLE WINAPI create_file(LPCWSTR path, DWORD access, DWORD share, LPSECURITY_ATTRIBUTES security,
+                          DWORD creation, DWORD flags, HANDLE source);
+HANDLE WINAPI open_process(DWORD access, BOOL inherit, DWORD pid);
 }
 
-// Only the shell consent boundary and the selected parent's elevation report
-// are simulated. Pipes, authentication, processes, token reads in children,
-// file access, handle duplication, and waits remain real production operations.
+// The shell consent boundary, selected parent's elevation report, and exact
+// one-shot permission failures are simulated. Successful I/O, authentication,
+// child token reads, handle duplication, and waits use real Windows operations.
 #define ShellExecuteExW ::elevation_fault::shell_execute
 #define GetTokenInformation ::elevation_fault::token_information
+#define CreateFileW ::elevation_fault::create_file
+#define OpenProcess ::elevation_fault::open_process
 #include "../src/elevation.cpp"
+#undef OpenProcess
+#undef CreateFileW
 #undef GetTokenInformation
 #undef ShellExecuteExW
 
@@ -97,6 +104,10 @@ struct Plan {
     bool report_unelevated = false;
     Mode mode = Mode::launch;
     std::size_t shell_calls = 0;
+    std::filesystem::path denied_file;
+    unsigned file_denials = 0;
+    DWORD denied_pid = 0;
+    unsigned process_denials = 0;
     std::vector<std::unique_ptr<ChildGuardian>> children;
 };
 
@@ -139,6 +150,32 @@ BOOL WINAPI token_information(const HANDLE token, const TOKEN_INFORMATION_CLASS 
         elevation.TokenIsElevated = 0;
     }
     return result;
+}
+
+HANDLE WINAPI create_file(const LPCWSTR path, const DWORD access, const DWORD share,
+                          const LPSECURITY_ATTRIBUTES security, const DWORD creation,
+                          const DWORD flags, const HANDLE source) {
+    if (active != nullptr && active->file_denials != 0 && path != nullptr &&
+        steamfix::paths::equal_windows(std::filesystem::path(path), active->denied_file)) {
+        check(active->file_denials == 1 && access == FILE_READ_DATA && share == FILE_SHARE_READ &&
+              security == nullptr && creation == OPEN_EXISTING && flags == FILE_ATTRIBUTE_NORMAL && source == nullptr,
+              "A file-denial fixture escaped its exact initial renderer request");
+        --active->file_denials;
+        SetLastError(ERROR_ACCESS_DENIED);
+        return INVALID_HANDLE_VALUE;
+    }
+    return ::CreateFileW(path, access, share, security, creation, flags, source);
+}
+
+HANDLE WINAPI open_process(const DWORD access, const BOOL inherit, const DWORD pid) {
+    if (active != nullptr && active->process_denials != 0 && pid == active->denied_pid) {
+        check(active->process_denials == 1 && access == steamfix::elevation::terminate_access && !inherit,
+              "A process-denial fixture escaped its exact initial owned-process request");
+        --active->process_denials;
+        SetLastError(ERROR_PRIVILEGE_NOT_HELD);
+        return nullptr;
+    }
+    return ::OpenProcess(access, inherit, pid);
 }
 
 bool validate_shell_request(const SHELLEXECUTEINFOW* execute) {
@@ -984,6 +1021,101 @@ void check_broker_and_relaunch_boundaries() {
     require(elevation::is_elevated(), "A scoped elevation-report simulation escaped into later tests");
 }
 
+void check_elevated_permission_fallbacks() {
+    if (!elevation_fault::real_elevated()) {
+        std::cout << "SKIP: permission-fallback fixtures require an already elevated token; no UAC is started.\n";
+        return;
+    }
+    TemporaryDirectory fixture;
+    const fs::path& directory = fixture.path();
+    const fs::path self = elevation::executable_path();
+    const fs::path destiny = directory / L"destiny2.exe";
+    const fs::path steam = directory / L"steamwebhelper.exe";
+    fs::copy_file(self, destiny);
+    fs::copy_file(self, steam);
+    create_file(directory / L"destiny2launcher.exe");
+    create_file(directory / L"steam.exe");
+    const fs::path renderer = directory / L"GameOverlayRenderer64.dll";
+    constexpr std::string_view contents = "permission fallback renderer";
+    create_file(renderer, contents);
+
+    elevation_fault::Plan plan;
+    plan.self = self;
+    plan.directory = directory;
+    const auto start_suspended = [&](const fs::path& image) {
+        std::wstring command;
+        steamfix::command_line::append_quoted(command, image.native());
+        steamfix::command_line::append_quoted(command, elevation_fault::exit_switch);
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION information{};
+        if (!CreateProcessW(image.c_str(), command.data(), nullptr, nullptr, FALSE,
+                            CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr, directory.c_str(), &startup, &information)) {
+            elevation::fail(GetLastError());
+        }
+        const steamfix::UniqueHandle thread(information.hThread);
+        steamfix::UniqueHandle process(information.hProcess);
+        try {
+            plan.children.push_back(std::make_unique<elevation_fault::ChildGuardian>(process.get()));
+        } catch (...) {
+            TerminateProcess(process.get(), ERROR_CANCELLED);
+            WaitForSingleObject(process.get(), 10000);
+            throw;
+        }
+        return process;
+    };
+    // Copies never execute: suspended children expose only test-owned process
+    // images to the production allowlist and remain guarded by retained handles.
+    const auto destiny_child = start_suspended(destiny);
+    const auto steam_child = start_suspended(steam);
+    const DWORD destiny_pid = GetProcessId(destiny_child.get());
+    const DWORD steam_pid = GetProcessId(steam_child.get());
+    require(destiny_pid != 0 && steam_pid != 0, "Cannot identify the suspended fixture processes");
+    {
+        const elevation_fault::Scope boundary(plan);
+        plan.denied_file = renderer;
+        plan.file_denials = 1;
+        auto file = elevation::open_file(renderer, FILE_READ_DATA, FILE_SHARE_READ,
+                                         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
+        std::array<char, 128> bytes{};
+        DWORD read{};
+        require(plan.file_denials == 0 &&
+                ReadFile(file.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr) &&
+                std::string_view(bytes.data(), read) == contents,
+                "The public file opener did not recover from its initial permission denial");
+
+        plan.denied_pid = destiny_pid;
+        plan.process_denials = 1;
+        auto process = elevation::open_process_for_termination(destiny_pid);
+        require(plan.process_denials == 0 && GetProcessId(process.get()) == destiny_pid &&
+                WaitForSingleObject(process.get(), 0) == WAIT_TIMEOUT && plan.shell_calls == 0,
+                "The public process opener did not use its already elevated allowlisted fallback");
+
+        HelperFixture helper;
+        elevation::Request request{};
+        request.operation = elevation::Operation::open_process;
+        request.pid = destiny_pid;
+        const auto game_response = helper.exchange(request);
+        require(game_response.error == ERROR_SUCCESS && game_response.handle != 0,
+                "The authenticated helper rejected its owned game-process fixture");
+        const steamfix::UniqueHandle game_handle(reinterpret_cast<HANDLE>(game_response.handle));
+        request.pid = steam_pid;
+        const auto steam_response = helper.exchange(request);
+        require(steam_response.error == ERROR_SUCCESS && steam_response.handle != 0,
+                "The authenticated helper rejected its owned Steam-process fixture");
+        const steamfix::UniqueHandle steam_handle(reinterpret_cast<HANDLE>(steam_response.handle));
+        require(helper.disconnect() == ERROR_SUCCESS && GetProcessId(game_handle.get()) == destiny_pid &&
+                GetProcessId(steam_handle.get()) == steam_pid &&
+                WaitForSingleObject(game_handle.get(), 0) == WAIT_TIMEOUT &&
+                WaitForSingleObject(steam_handle.get(), 0) == WAIT_TIMEOUT,
+                "Transferred process handles lost their identity or synchronization rights after helper exit");
+        require(TerminateProcess(process.get(), ERROR_CANCELLED) &&
+                TerminateProcess(steam_handle.get(), ERROR_CANCELLED) &&
+                plan.children[0]->wait() == ERROR_CANCELLED && plan.children[1]->wait() == ERROR_CANCELLED,
+                "The public or helper process grant lacks termination rights for its owned fixture");
+    }
+}
+
 void check_errors_and_entry_points() {
     require(elevation::permission_denied(ERROR_ACCESS_DENIED) &&
             elevation::permission_denied(ERROR_PRIVILEGE_NOT_HELD) &&
@@ -1074,6 +1206,7 @@ int main() {
         check_errors_and_entry_points();
         check_authenticated_helper();
         check_broker_and_relaunch_boundaries();
+        check_elevated_permission_fallbacks();
     } catch (const std::exception& error) {
         std::cerr << "Elevation regression test failed: " << error.what() << '\n';
         return 1;

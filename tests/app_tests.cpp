@@ -238,6 +238,7 @@ std::optional<int> app_test_relaunch(const std::vector<std::wstring>& arguments,
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <memory>
 #include <string_view>
 #include <thread>
 #include <type_traits>
@@ -487,6 +488,35 @@ int authenticated_entry(const fs::path& steam, const fs::path& launcher) {
     return steamfix::windows_exit_status(status);
 }
 
+class SuspendedChild final {
+public:
+    explicit SuspendedChild(const fs::path& executable) {
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION information{};
+        require(CreateProcessW(executable.c_str(), nullptr, nullptr, nullptr, FALSE,
+                               CREATE_SUSPENDED | CREATE_NO_WINDOW, nullptr,
+                               executable.parent_path().c_str(), &startup, &information) != FALSE,
+                "create already-running fixture child");
+        process_ = steamfix::UniqueHandle(information.hProcess);
+        const steamfix::UniqueHandle thread(information.hThread);
+    }
+    ~SuspendedChild() noexcept {
+        if (alive()) {
+            // Only the handle returned by this object's CreateProcess is used.
+            TerminateProcess(process_.get(), ERROR_CANCELLED);
+            WaitForSingleObject(process_.get(), 5000);
+        }
+    }
+    SuspendedChild(const SuspendedChild&) = delete;
+    SuspendedChild& operator=(const SuspendedChild&) = delete;
+    SuspendedChild(SuspendedChild&&) = delete;
+    SuspendedChild& operator=(SuspendedChild&&) = delete;
+    [[nodiscard]] bool alive() const noexcept { return WaitForSingleObject(process_.get(), 0) == WAIT_TIMEOUT; }
+private:
+    steamfix::UniqueHandle process_;
+};
+
 void check_session(const fs::path& directory) {
     using namespace steamfix;
     const Environment app_id(L"SteamAppId", L"1085660");
@@ -525,6 +555,25 @@ void check_session(const fs::path& directory) {
     }
     require(!fs::exists(recovery) && read_file(renderer) == "immutable renderer contents" &&
             read_file(renderer32) == "immutable 32-bit contents", "session restores and cleans journal");
+    {
+        const SuspendedChild existing(game / L"destiny2.exe");
+        expect_error(ExitCode::existing_session, [&] { app::run(log, arguments, recovery, steam); });
+        require(existing.alive() && !fs::exists(recovery) && !repair::needed(steam, log),
+                "an existing verified game prevents permission changes and remains running");
+    }
+    {
+        const fs::path loaded_directory = directory / L"loaded overlay fixture";
+        fs::create_directory(loaded_directory);
+        const fs::path module = loaded_directory / L"GameOverlayRenderer64.dll";
+        fs::copy_file(self.parent_path() / L"overlay_fixture.dll", module);
+        const std::unique_ptr<std::remove_pointer_t<HMODULE>, decltype(&FreeLibrary)>
+            loaded(LoadLibraryW(module.c_str()), &FreeLibrary);
+        require(loaded != nullptr, "load owned overlay fixture into the test process");
+        expect_error(ExitCode::overlay_loaded, [&] { app::run(log, arguments, recovery, steam); });
+        require(!fs::exists(recovery) && !repair::needed(steam, log),
+                "a loaded overlay prevents permission changes and launcher creation");
+    }
+    app::check_overlay();
     const auto check_restored = [&] {
         require(!fs::exists(recovery) && !repair::needed(steam, log) &&
                 read_file(renderer) == "immutable renderer contents", "launch faults preserve original permissions");
