@@ -105,6 +105,139 @@ PipePair create_pipe_pair() {
     return {std::move(server), std::move(client)};
 }
 
+class TestChild final {
+public:
+    TestChild() noexcept = default;
+    ~TestChild() noexcept {
+        if (process_.get() != nullptr && WaitForSingleObject(process_.get(), 3000) == WAIT_TIMEOUT) {
+            // This process was created solely for this fixture. Bound cleanup
+            // even when a failed assertion leaves its helper waiting for input.
+            TerminateProcess(process_.get(), ERROR_CANCELLED);
+            WaitForSingleObject(process_.get(), 3000);
+        }
+    }
+    TestChild(const TestChild&) = delete;
+    TestChild& operator=(const TestChild&) = delete;
+    TestChild(TestChild&&) = delete;
+    TestChild& operator=(TestChild&&) = delete;
+    void adopt(const PROCESS_INFORMATION& information) noexcept {
+        process_.reset(information.hProcess);
+        thread_.reset(information.hThread);
+    }
+    HANDLE process() const noexcept { return process_.get(); }
+    DWORD wait() const {
+        const DWORD waited = WaitForSingleObject(process_.get(), 3000);
+        if (waited != WAIT_OBJECT_0) {
+            elevation::fail(waited == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError());
+        }
+        DWORD status{};
+        if (!GetExitCodeProcess(process_.get(), &status)) elevation::fail(GetLastError());
+        return status;
+    }
+private:
+    steamfix::UniqueHandle process_;
+    steamfix::UniqueHandle thread_;
+};
+
+class TestConnection final {
+public:
+    explicit TestConnection(const HANDLE pipe)
+        : pipe_(pipe), event_(CreateEventW(nullptr, TRUE, FALSE, nullptr)) {
+        overlap_.hEvent = event_.get();
+        if (!ConnectNamedPipe(pipe_, &overlap_)) {
+            const DWORD error = GetLastError();
+            if (error == ERROR_IO_PENDING) pending_ = true;
+            else if (error != ERROR_PIPE_CONNECTED) elevation::fail(error);
+        }
+    }
+    ~TestConnection() noexcept {
+        if (pending_) {
+            CancelIoEx(pipe_, &overlap_);
+            DWORD ignored{};
+            GetOverlappedResult(pipe_, &overlap_, &ignored, TRUE);
+        }
+    }
+    TestConnection(const TestConnection&) = delete;
+    TestConnection& operator=(const TestConnection&) = delete;
+    TestConnection(TestConnection&&) = delete;
+    TestConnection& operator=(TestConnection&&) = delete;
+    void wait(const HANDLE child) {
+        if (!pending_) return;
+        const std::array waits{event_.get(), child};
+        // Coverage instrumentation may pause a new child while loading symbols.
+        const DWORD waited = WaitForMultipleObjects(static_cast<DWORD>(waits.size()), waits.data(), FALSE, 10000);
+        if (waited != WAIT_OBJECT_0) elevation::fail(waited == WAIT_TIMEOUT ? ERROR_TIMEOUT : ERROR_BROKEN_PIPE);
+        DWORD ignored{};
+        if (!GetOverlappedResult(pipe_, &overlap_, &ignored, FALSE)) elevation::fail(GetLastError());
+        pending_ = false;
+    }
+private:
+    HANDLE pipe_;
+    steamfix::UniqueHandle event_;
+    OVERLAPPED overlap_{};
+    bool pending_ = false;
+};
+
+class HelperFixture final {
+public:
+    HelperFixture() {
+        const std::wstring name = L"\\\\.\\pipe\\D2SteamFix-" + unique_name();
+        pipe_.reset(CreateNamedPipeW(name.c_str(),
+            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+            1, 4096, 4096, 0, nullptr));
+        if (pipe_.get() == INVALID_HANDLE_VALUE) elevation::fail(GetLastError());
+        TestConnection connection(pipe_.get());
+        const fs::path executable = elevation::executable_path();
+        std::wstring command;
+        steamfix::command_line::append_quoted(command, executable.native());
+        steamfix::command_line::append_quoted(command, elevation::helper_switch);
+        steamfix::command_line::append_quoted(command, std::to_wstring(GetCurrentProcessId()));
+        steamfix::command_line::append_quoted(command, name);
+        STARTUPINFOW startup{};
+        startup.cb = sizeof(startup);
+        PROCESS_INFORMATION information{};
+        if (!CreateProcessW(executable.c_str(), command.data(), nullptr, nullptr, FALSE,
+                            CREATE_NO_WINDOW, nullptr, nullptr, &startup, &information)) elevation::fail(GetLastError());
+        child_.adopt(information);
+        connection.wait(child_.process());
+        ULONG client{};
+        require(GetNamedPipeClientProcessId(pipe_.get(), &client) && client == GetProcessId(child_.process()),
+                "The fixture pipe connected to an unexpected process");
+    }
+    ~HelperFixture() noexcept { pipe_.reset(); }
+    HelperFixture(const HelperFixture&) = delete;
+    HelperFixture& operator=(const HelperFixture&) = delete;
+    HelperFixture(HelperFixture&&) = delete;
+    HelperFixture& operator=(HelperFixture&&) = delete;
+    elevation::Response exchange(elevation::Request request, const fs::path& path = {}, const fs::path& second = {}) {
+        require(path.native().size() <= elevation::max_path_units && second.native().size() <= elevation::max_path_units,
+                "Fixture paths exceed the helper protocol limit");
+        request.path_units = static_cast<DWORD>(path.native().size());
+        request.second_path_units = static_cast<DWORD>(second.native().size());
+        send(request);
+        elevation::transfer(pipe_.get(), std::as_bytes(std::span{path.native()}), 3000);
+        elevation::transfer(pipe_.get(), std::as_bytes(std::span{second.native()}), 3000);
+        return elevation::read_object<elevation::Response>(pipe_.get(), 3000);
+    }
+    void send(const elevation::Request& request) {
+        elevation::transfer(pipe_.get(), std::as_bytes(std::span{&request, 1}), 3000);
+    }
+    void send_prefix(const elevation::Request& request) {
+        const auto bytes = std::as_bytes(std::span{&request, 1});
+        elevation::transfer(pipe_.get(), bytes.first(bytes.size() / 2U), 3000);
+    }
+    DWORD wait() const { return child_.wait(); }
+    DWORD disconnect() {
+        pipe_.reset();
+        return child_.wait();
+    }
+private:
+    // Destruction closes the pipe before waiting for the exclusively owned child.
+    TestChild child_;
+    steamfix::UniqueHandle pipe_;
+};
+
 void check_protocol_and_transport() {
     PipePair pipe = create_pipe_pair();
     elevation::Request request{};
@@ -346,6 +479,156 @@ void check_privilege_restoration() {
     require(!enabled(), "The scoped privilege was not restored during unwinding");
 }
 
+bool has_token_privilege(const wchar_t* name) {
+    LUID identifier{};
+    if (!LookupPrivilegeValueW(nullptr, name, &identifier)) elevation::fail(GetLastError());
+    const auto privileges = token_privileges();
+    return std::ranges::any_of(privileges, [&](const auto& privilege) {
+        return privilege.Luid.LowPart == identifier.LowPart && privilege.Luid.HighPart == identifier.HighPart &&
+               (privilege.Attributes & SE_PRIVILEGE_REMOVED) == 0;
+    });
+}
+
+void check_authenticated_helper() {
+    if (!elevation::is_elevated()) {
+        std::cout << "SKIP: authenticated helper-loop fixtures require an already elevated test token; no UAC is started.\n";
+        return;
+    }
+    TemporaryDirectory fixture;
+    const fs::path& directory = fixture.path();
+    create_file(directory / L"steam.exe");
+    create_file(directory / L"destiny2.exe");
+    create_file(directory / L"destiny2launcher.exe");
+    const fs::path renderer = directory / L"GameOverlayRenderer64.dll";
+    constexpr std::string_view renderer_contents = "helper renderer fixture";
+    create_file(renderer, renderer_contents);
+
+    HelperFixture helper;
+    elevation::Request request{};
+    request.operation = elevation::Operation::open_file;
+    request.access = WRITE_OWNER;
+    request.share = FILE_SHARE_READ;
+    request.creation = OPEN_EXISTING;
+    auto response = helper.exchange(request, renderer);
+    require(response.error == ERROR_ACCESS_DENIED && response.reserved == 0 && response.handle == 0,
+            "The helper granted a forbidden file access mask");
+    request.access = FILE_READ_DATA;
+    request.share = MAXDWORD;
+    require(helper.exchange(request, renderer).error == ERROR_ACCESS_DENIED,
+            "The helper accepted unsupported sharing flags");
+    request.share = FILE_SHARE_READ;
+    request.flags = FILE_FLAG_DELETE_ON_CLOSE;
+    require(helper.exchange(request, renderer).error == ERROR_ACCESS_DENIED,
+            "The helper accepted a destructive file flag");
+    request.flags = 0;
+    request.creation = CREATE_ALWAYS;
+    require(helper.exchange(request, renderer).error == ERROR_ACCESS_DENIED,
+            "The helper accepted renderer replacement");
+    request.creation = OPEN_EXISTING;
+    request.operation = static_cast<elevation::Operation>(MAXDWORD);
+    require(helper.exchange(request).error == ERROR_INVALID_DATA, "The helper accepted an unknown operation");
+    request.operation = elevation::Operation::open_process;
+    request.pid = 0;
+    require(helper.exchange(request).error == ERROR_INVALID_PARAMETER,
+            "The helper accepted an invalid process identifier");
+    request.pid = GetCurrentProcessId();
+    response = helper.exchange(request);
+    require(response.error != ERROR_SUCCESS && response.handle == 0,
+            "The helper granted termination access to the test executable");
+    request.operation = elevation::Operation::move_state;
+    require(helper.exchange(request, renderer, directory / L"other.dat").error == ERROR_ACCESS_DENIED,
+            "The helper accepted an unrelated recovery rename");
+    request.operation = elevation::Operation::rotate_log;
+    require(helper.exchange(request, directory / L"other.log").error == ERROR_ACCESS_DENIED,
+            "The helper accepted an unrelated log path");
+
+    request = elevation::Request{};
+    request.operation = elevation::Operation::open_file;
+    request.access = FILE_READ_DATA;
+    request.share = FILE_SHARE_READ;
+    request.creation = OPEN_EXISTING;
+    response = helper.exchange(request, renderer);
+    require(response.error == ERROR_SUCCESS && response.reserved == 0 && response.handle != 0,
+            "The authenticated helper could not open an allowed renderer fixture");
+    steamfix::UniqueHandle duplicated(reinterpret_cast<HANDLE>(response.handle));
+
+    if (has_token_privilege(SE_BACKUP_NAME) && has_token_privilege(SE_RESTORE_NAME)) {
+        const fs::path temporary = directory / L"steamfix.dat.tmp";
+        const fs::path recovery = directory / L"steamfix.dat";
+        request.access = GENERIC_WRITE;
+        request.share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+        request.creation = CREATE_NEW;
+        response = helper.exchange(request, temporary);
+        require(response.error == ERROR_SUCCESS && response.handle != 0,
+                "The helper could not create a private recovery fixture");
+        steamfix::UniqueHandle journal(reinterpret_cast<HANDLE>(response.handle));
+        constexpr std::string_view journal_contents = "private helper recovery fixture";
+        DWORD written{};
+        require(WriteFile(journal.get(), journal_contents.data(), static_cast<DWORD>(journal_contents.size()),
+                          &written, nullptr) && written == journal_contents.size(),
+                "The duplicated recovery handle was not writable");
+        const auto user = elevation::token_user(GetCurrentProcess());
+        elevation::check_owner(journal.get(), elevation::user_sid(user));
+        journal.reset();
+        request.operation = elevation::Operation::move_state;
+        response = helper.exchange(request, temporary, recovery);
+        require(response.error == ERROR_SUCCESS && response.handle == 0 &&
+                !fs::exists(temporary) && fs::exists(recovery), "The helper could not rename its private recovery file");
+
+        const fs::path log = directory / L"steamfix.log";
+        create_file(log);
+        {
+            auto file = elevation::open_file(log, GENERIC_WRITE, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL);
+            LARGE_INTEGER length{};
+            length.QuadPart = 4LL * 1024LL * 1024LL + 1;
+            require(SetFilePointerEx(file.get(), length, nullptr, FILE_BEGIN) && SetEndOfFile(file.get()),
+                    "Cannot resize the helper log fixture");
+        }
+        create_file(directory / L"steamfix.log.old", "preserve helper archive");
+        request.operation = elevation::Operation::rotate_log;
+        response = helper.exchange(request, log);
+        require(response.error == ERROR_SUCCESS && response.handle == 1 && !fs::exists(log) &&
+                fs::file_size(directory / L"steamfix.log.old.1") > 4U * 1024U * 1024U,
+                "The helper did not archive its oversized log fixture");
+        response = helper.exchange(request, log);
+        require(response.error == ERROR_SUCCESS && response.handle == 0,
+                "The helper did not defer rotation of a missing log");
+    } else {
+        std::cout << "SKIP: the elevated token lacks backup/restore privileges for private recovery and log fixtures.\n";
+    }
+
+    require(helper.disconnect() == ERROR_SUCCESS, "A helper did not exit cleanly after its pipe disconnected");
+    // The transferred handle belongs to this process and remains usable after
+    // the helper, including its original source handle, has exited.
+    std::array<char, 128> data{};
+    DWORD read{};
+    require(ReadFile(duplicated.get(), data.data(), static_cast<DWORD>(data.size()), &read, nullptr) &&
+            std::string_view(data.data(), read) == renderer_contents,
+            "A duplicated renderer handle did not survive helper exit");
+    duplicated.reset();
+
+    {
+        HelperFixture malformed;
+        elevation::Request invalid{};
+        invalid.magic = 0;
+        malformed.send(invalid);
+        require(malformed.wait() == ERROR_INVALID_DATA, "The helper accepted invalid protocol magic");
+    }
+    {
+        HelperFixture malformed;
+        elevation::Request invalid{};
+        invalid.path_units = elevation::max_path_units + 1;
+        malformed.send(invalid);
+        require(malformed.wait() == ERROR_INVALID_DATA, "The helper accepted an oversized path frame");
+    }
+    {
+        HelperFixture truncated;
+        const elevation::Request partial{};
+        truncated.send_prefix(partial);
+        require(truncated.disconnect() == ERROR_SUCCESS, "A truncated request leaked its waiting helper process");
+    }
+}
+
 void check_errors_and_entry_points() {
     require(elevation::permission_denied(ERROR_ACCESS_DENIED) &&
             elevation::permission_denied(ERROR_PRIVILEGE_NOT_HELD) &&
@@ -398,10 +681,24 @@ void check_errors_and_entry_points() {
 
 int main() {
     try {
+        // The subprocess exercises the production helper entry before running
+        // any fixtures; otherwise it would recursively start another test run.
+        struct ArgumentsDeleter {
+            void operator()(wchar_t** arguments) const noexcept { LocalFree(arguments); }
+        };
+        int count{};
+        const std::unique_ptr<wchar_t*, ArgumentsDeleter> parsed(CommandLineToArgvW(GetCommandLineW(), &count));
+        require(parsed != nullptr && count > 0, "Cannot parse the fixture command line");
+        std::vector<std::wstring> arguments;
+        for (const auto* argument : std::span{parsed.get(), static_cast<std::size_t>(count)}.subspan(1)) {
+            arguments.emplace_back(argument);
+        }
+        if (const auto status = elevation::dispatch_helper(arguments)) return *status;
         check_protocol_and_transport();
         check_paths_and_file_operations();
         check_privilege_restoration();
         check_errors_and_entry_points();
+        check_authenticated_helper();
     } catch (const std::exception& error) {
         std::cerr << "Elevation regression test failed: " << error.what() << '\n';
         return 1;

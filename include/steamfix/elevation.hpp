@@ -1,4 +1,5 @@
-#pragma once
+#ifndef STEAMFIX_ELEVATION_HPP
+#define STEAMFIX_ELEVATION_HPP
 
 #include "steamfix/win32.hpp"
 
@@ -83,3 +84,5 @@ bool launch_as_desktop_user(const std::filesystem::path& executable,
                             PROCESS_INFORMATION& information);
 
 } // namespace steamfix::elevation
+
+#endif // STEAMFIX_ELEVATION_HPP

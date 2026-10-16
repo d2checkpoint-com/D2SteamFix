@@ -1,4 +1,5 @@
-#pragma once
+#ifndef STEAMFIX_WIN32_HPP
+#define STEAMFIX_WIN32_HPP
 
 #include <windows.h>
 
@@ -120,3 +121,5 @@ inline std::string windows_error(DWORD code = GetLastError()) {
 }
 
 } // namespace steamfix
+
+#endif // STEAMFIX_WIN32_HPP

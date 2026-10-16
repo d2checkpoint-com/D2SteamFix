@@ -18,15 +18,29 @@ def line_ranges(lines):
 
 def summarize(report, source_root):
     files = {}
-    for item in ET.parse(report).iter("class"):
+    document = ET.parse(report)
+    source_roots = [source_root]
+    for source in document.findall("./sources/source"):
+        root = (source.text or "").replace("\\", "/")
+        if len(root) == 2 and root[1] == ":":
+            # OpenCppCoverage stores root_name() ("D:") separately from the
+            # drive-relative filename. Resolve from D:/, not D:'s current dir.
+            root += "/"
+        if root:
+            source_roots.append(Path(root))
+    for item in document.iter("class"):
         source = Path(item.attrib["filename"].replace("\\", "/"))
-        if not source.is_absolute():
-            source = source_root / source
-        try:
-            relative = source.resolve().relative_to(source_root).as_posix()
-        except ValueError:
-            continue
-        if not relative.startswith(("src/", "include/")):
+        candidates = [source] if source.is_absolute() else [root / source for root in source_roots]
+        relative = None
+        for candidate in candidates:
+            try:
+                path = candidate.resolve().relative_to(source_root).as_posix()
+            except ValueError:
+                continue
+            if path.startswith(("src/", "include/")):
+                relative = path
+                break
+        if relative is None:
             continue
         lines = files.setdefault(relative, {})
         for line in item.findall("./lines/line"):

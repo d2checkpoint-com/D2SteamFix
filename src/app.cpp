@@ -18,7 +18,6 @@
 #include <cstddef>
 #include <exception>
 #include <filesystem>
-#include <memory>
 #include <optional>
 #include <span>
 #include <sstream>
@@ -392,6 +391,16 @@ Invocation validate_invocation(const std::vector<std::wstring>& args,
     return {launcher, game_dir, std::vector<std::wstring>(args.begin() + 1, args.end())};
 }
 
+Logger create_log(const fs::path& path) {
+    try {
+        return Logger(path);
+    } catch (const elevation::Cancelled&) {
+        throw;
+    } catch (const std::exception& error) {
+        throw AppError(ExitCode::log_initialization, "log initialization", error.what());
+    }
+}
+
 } // namespace
 
 int entry() noexcept try {
@@ -425,74 +434,79 @@ int entry() noexcept try {
                   L"recovery files.\n\n" + widen(error.what()) + L"\n\nDestiny 2 was not started.");
         return static_cast<int>(ExitCode::log_initialization);
     }
-    std::unique_ptr<Logger> log;
-    try {
-        log = std::make_unique<Logger>(game_directory / L"steamfix.log");
-    } catch (const elevation::Cancelled&) {
-        return 0;
-    } catch (const std::exception& error) {
-        ui::error(L"D2SteamFix could not open steamfix.log in the Destiny 2 directory. "
-                  L"Ensure the game directory is writable.\n\n" + widen(error.what()) +
-                  L"\n\nDestiny 2 was not started.");
-        return static_cast<int>(ExitCode::log_initialization);
-    }
-    log->info("startup; wrapper path: " + display_path(executable) +
+    const Logger log = create_log(game_directory / L"steamfix.log");
+    log.info("startup; wrapper path: " + display_path(executable) +
               "; game directory: " + display_path(game_directory));
     try {
         const fs::path recovery = acl::recovery_path(game_directory);
-        log->info("ACL recovery state path: " + display_path(recovery));
+        log.info("ACL recovery state path: " + display_path(recovery));
         if (forwarded.empty()) {
-            static_cast<void>(repair::run(game_directory, recovery, *log));
-            log->info("direct Steam repair finished; final exit status: 0");
+            static_cast<void>(repair::run(game_directory, recovery, log));
+            log.info("direct Steam repair finished; final exit status: 0");
             return 0;
         }
         const SessionMutex mutex = session_mutex();
-        const int code = run(*log, forwarded, recovery, inherited_steam_directory);
-        log->info("final exit status: " + std::to_string(code));
+        const int code = run(log, forwarded, recovery, inherited_steam_directory);
+        log.info("final exit status: " + std::to_string(code));
         return code;
     } catch (const elevation::RelaunchRequired& request) {
         // The protected session and its mutex have both unwound before UAC.
         try {
-            log->info("original renderer permissions restored; requesting an administrator D2SteamFix session");
+            log.info("original renderer permissions restored; requesting an administrator D2SteamFix session");
             std::vector<std::wstring> retry = forwarded;
             // Resolve a relative Steam command once, in its original directory.
             retry.front() = request.launcher().native();
             const std::optional<int> code = elevation::relaunch_as_administrator(retry, request.directory(),
                                                                                      request.steam_directory());
             if (code) {
-                log->info("administrator D2SteamFix session exit status: " + std::to_string(*code));
+                log.info("administrator D2SteamFix session exit status: " + std::to_string(*code));
             } else {
-                log->warn("administrator D2SteamFix session exited; Windows did not provide its exit status");
+                log.warn("administrator D2SteamFix session exited; Windows did not provide its exit status");
             }
             return code.value_or(0);
         } catch (const elevation::Cancelled&) {
-            log->info("Windows permission request cancelled; original permissions remain restored");
+            log.info("Windows permission request cancelled; original permissions remain restored");
             return 0;
         } catch (const std::exception& error) {
-            log->error("administrator session launch or monitoring failed: " + std::string(error.what()));
+            log.error("administrator session launch or monitoring failed: " + std::string(error.what()));
             ui::error(L"D2SteamFix could not complete its administrator session.\n\n" + widen(error.what()) +
                       L"\n\nOriginal renderer permissions were restored before the administrator session was requested.");
             return static_cast<int>(ExitCode::process_creation);
         }
     } catch (const elevation::Cancelled&) {
-        log->info("Windows permission request cancelled; no launcher was started");
+        log.info("Windows permission request cancelled; no launcher was started");
         return 0;
     } catch (const AppError& error) {
-        log->error(std::string(error.what()) + "; helper exit code=" +
+        log.error(std::string(error.what()) + "; helper exit code=" +
                    std::to_string(static_cast<int>(error.code())));
         ui::error(failure_message(error));
         return static_cast<int>(error.code());
     } catch (const std::exception& error) {
-        log->error("unexpected internal failure: " + std::string(error.what()) + "; helper exit code=19");
+        log.error("unexpected internal failure: " + std::string(error.what()) + "; helper exit code=19");
         ui::error(L"D2SteamFix encountered an unexpected internal failure.\n\nSee steamfix.log in the "
                   L"Destiny 2 directory.\n\nDestiny 2 was not started.");
         return static_cast<int>(ExitCode::internal);
     } catch (...) {
-        log->error("unexpected internal failure; helper exit code=19");
+        log.error("unexpected internal failure; helper exit code=19");
         ui::error(L"D2SteamFix encountered an unexpected internal failure.\n\nSee steamfix.log in the "
                   L"Destiny 2 directory.\n\nDestiny 2 was not started.");
         return static_cast<int>(ExitCode::internal);
     }
+} catch (const elevation::Cancelled&) {
+    return 0;
+} catch (const AppError& error) {
+    try {
+        if (error.code() == ExitCode::log_initialization) {
+            ui::error(L"D2SteamFix could not open steamfix.log in the Destiny 2 directory. "
+                      L"Ensure the game directory is writable.\n\n" + widen(error.detail()) +
+                      L"\n\nDestiny 2 was not started.");
+        } else {
+            ui::error(failure_message(error));
+        }
+    } catch (...) {
+        ui::error(L"D2SteamFix could not report an initialization failure.");
+    }
+    return static_cast<int>(error.code());
 } catch (...) {
     // Error formatting and startup logging can allocate too. Keep every failure
     // inside the C++ boundary and use an allocation-free last-resort message.

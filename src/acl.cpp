@@ -953,6 +953,11 @@ std::optional<PreparedRecovery> prepare_recovery_entry(const RecoveryEntry& entr
         }
     }();
     if (!observed) return std::nullopt;
+    // Core Check loses the optional aggregate's identity after the factory
+    // return. It is engaged here and owns its handle and scalar identity.
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
     if (observed->identity != entry.identity) {
         log.warn("skipped ACL recovery because renderer identity changed: " + shown);
         return std::nullopt;
@@ -963,10 +968,16 @@ std::optional<PreparedRecovery> prepare_recovery_entry(const RecoveryEntry& entr
     }
     OpenedTarget writable = open_target(
         entry.backup.path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES);
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
     if (writable.identity != entry.identity || writable.identity != observed->identity) {
         throw std::runtime_error("renderer identity changed while ACL recovery was opening it: " + shown);
     }
     static_cast<void>(restoration_state(entry.backup, writable.handle.get()));
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
     return PreparedRecovery{std::move(*observed), std::move(writable)};
 }
 
@@ -995,6 +1006,11 @@ bool recover_pending(const fs::path& path, const Logger& log) {
         for (const RecoveryEntry& entry : entries) {
             std::optional<PreparedRecovery> target = prepare_recovery_entry(entry, log);
             if (target) {
+                // The engaged optional owns both handles; moving its aggregate
+                // transfers ownership without borrowing from either vector.
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
                 prepared.push_back(std::move(*target));
             } else {
                 ++skipped;
@@ -1045,16 +1061,22 @@ Protection Protection::apply(const std::span<const fs::path> targets, fs::path s
         identities.reserve(targets.size());
         resuming = fs::exists(state_path);
         if (resuming) {
-            std::vector<RecoveryEntry> entries = read_state(state_path);
+            const std::vector<RecoveryEntry> entries = read_state(state_path);
             if (entries.size() != targets.size()) {
                 throw std::runtime_error(
                     "saved renderer set does not match the selected Steam renderer files; "
                     "original recovery backup was preserved");
             }
             std::vector<bool> matched(entries.size(), false);
+            // Core Check mistakes the returned records' owning filesystem paths
+            // for borrowed storage. This const vector remains alive and unchanged
+            // through the loop; copying a Backup also copies its owning members.
             for (const fs::path& target : targets) {
                 size_t match = entries.size();
                 for (size_t index = 0; index < entries.size(); ++index) {
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
                     if (!paths::equal_windows(target, entries[index].backup.path)) continue;
                     if (matched[index] || match != entries.size()) {
                         throw std::runtime_error("saved renderer set contains duplicate targets");
@@ -1066,13 +1088,18 @@ Protection Protection::apply(const std::span<const fs::path> targets, fs::path s
                                              "recovery backup: " + display_path(target));
                 }
                 try {
-                    std::optional<PreparedRecovery> prepared =
-                        prepare_recovery_entry(entries[match], log);
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
+                    auto prepared = prepare_recovery_entry(entries[match], log);
                     if (!prepared) {
                         throw std::runtime_error("renderer could not be safely matched to its "
                                                  "original recovery backup");
                     }
                     matched[match] = true;
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
                     backups.push_back(entries[match].backup);
                     handles.push_back(std::move(prepared->writable.handle));
                 } catch (const elevation::Cancelled&) {
@@ -1099,15 +1126,28 @@ Protection Protection::apply(const std::span<const fs::path> targets, fs::path s
             throw protection_error("current-user identity", error);
         }
     }();
+    // Backup owns its path and byte vectors. The factory/copies/moves above
+    // transfer that storage; backups is not resized or moved again until return.
+    // Suppress only Core Check's false borrowed-path diagnostics at their uses.
     try {
         if (!resuming) {
             for (Backup& backup : backups) {
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
                 if (has_current_user_execute_deny(backup, identity.sid())) {
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
+                    const std::string shown = display_path(backup.path);
                     throw std::runtime_error(
                         "current-user execute access is already denied but no matching recovery "
                         "backup was found; preserve any existing steamfix.dat files: " +
-                        display_path(backup.path));
+                        shown);
                 }
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
                 backup.denied_acl = make_denied_acl(backup, identity.sid());
             }
         }
@@ -1127,14 +1167,25 @@ Protection Protection::apply(const std::span<const fs::path> targets, fs::path s
     if (resuming) log.info("reusing original renderer permissions from existing recovery backup");
     for (size_t index = 0; index < backups.size(); ++index) {
         try {
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
+            const std::string shown = display_path(backups[index].path);
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
             if (restoration_state(backups[index], handles[index].get()) == RestorationState::denied) {
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
                 verify_protection(backups[index], handles[index].get());
-                log.info("retained current-user execute denial from interrupted session: " +
-                         display_path(backups[index].path));
+                log.info("retained current-user execute denial from interrupted session: " + shown);
             } else {
+#ifdef _MSC_VER
+#pragma warning(suppress: 26486)
+#endif
                 deny(backups[index], handles[index].get());
-                log.info("temporarily denied current-user execute access: " +
-                         display_path(backups[index].path));
+                log.info("temporarily denied current-user execute access: " + shown);
             }
         } catch (const std::exception& error) {
             bool restored = false;

@@ -1,4 +1,5 @@
-#pragma once
+#ifndef STEAMFIX_ACL_HPP
+#define STEAMFIX_ACL_HPP
 
 #include "steamfix/win32.hpp"
 
@@ -52,3 +53,5 @@ std::filesystem::path recovery_path(const std::filesystem::path& game_directory)
 bool recover_pending(const std::filesystem::path& path, const Logger& log);
 
 } // namespace steamfix::acl
+
+#endif // STEAMFIX_ACL_HPP

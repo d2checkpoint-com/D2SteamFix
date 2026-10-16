@@ -1,4 +1,5 @@
-#pragma once
+#ifndef STEAMFIX_LOGGING_HPP
+#define STEAMFIX_LOGGING_HPP
 
 #include "steamfix/win32.hpp"
 
@@ -22,3 +23,5 @@ private:
 };
 
 } // namespace steamfix
+
+#endif // STEAMFIX_LOGGING_HPP

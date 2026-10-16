@@ -1,4 +1,5 @@
-#pragma once
+#ifndef STEAMFIX_ERROR_HPP
+#define STEAMFIX_ERROR_HPP
 
 #include <memory>
 #include <stdexcept>
@@ -53,3 +54,5 @@ private:
 };
 
 } // namespace steamfix
+
+#endif // STEAMFIX_ERROR_HPP

@@ -74,8 +74,9 @@ and the recovery journal remain available for diagnosis. A missing optional
 32-bit renderer is distinguished from a filesystem inspection failure, including
 standard-library implementations that also set an error code for a missing path.
 
-**SF.10, SF.11, Con.1.** Headers and source files include their direct
-dependencies. New local bindings are immutable where their values do not
+**SF.8, SF.10, SF.11, Con.1.** All project headers use standard component-specific
+include guards and compile independently, including when included twice. Headers
+and source files include their direct dependencies. New local bindings are immutable where their values do not
 change. The project remains C++20 with warnings as errors and the existing
 security/linker settings.
 
@@ -114,6 +115,16 @@ Microsoft C++ Core Check ruleset. It enforces selected ownership, special-member
 initialization, and lifetime diagnostics as errors; it does not check every
 guideline. The optional full Microsoft ruleset is described in
 [BUILDING.md](BUILDING.md).
+
+Native MSVC analysis exposed limitations in its experimental lifetime model for
+engaged optionals and owning aggregates containing filesystem paths. The
+remaining ACL diagnostics have statement-specific suppressions with the storage
+invariant documented next to each call; independent review confirmed the owners
+outlive those uses. Tests also locally suppress moved-from diagnostics where
+they intentionally verify an explicitly supported empty or preserved state.
+No selected rule is disabled globally. Other reports were resolved by removing
+a borrowed recovery-entry pointer, using immutable span views, copying a
+timestamp value, and constructing the logger directly in its final scope.
 
 Tests exercise actual production implementations and real Windows APIs on
 test-owned directories, registry overrides, pipes, mutexes, module fixtures, and

@@ -205,10 +205,12 @@ void check_logging(const fs::path& directory) {
     try {
         const steamfix::Logger unsafe(path);
         throw std::logic_error("expected linked log rejection");
-    } catch (const std::runtime_error& error) {
-        require(std::string_view(error.what()).find("without links") != std::string_view::npos,
-                "hardlinked log rejected");
+    } catch (const std::system_error& error) {
+        require(error.code().category() == std::system_category() &&
+                error.code().value() == ERROR_INVALID_DATA, "hardlinked log rejected before rotation");
     }
+    expect_error(steamfix::ExitCode::log_initialization,
+                 [&] { const auto rejected = steamfix::app::create_log(path); });
     fs::remove(linked);
 }
 
@@ -226,6 +228,35 @@ int fixture_launcher() {
     const steamfix::UniqueHandle thread(information.hThread);
     require(WaitForSingleObject(process.get(), 10000) == WAIT_OBJECT_0, "fixture game exits");
     return 7;
+}
+
+int authenticated_entry(const fs::path& steam, const fs::path& launcher) {
+    // An already elevated test can exercise the authenticated coordinator
+    // handoff with CreateProcess, avoiding any runas/UAC prompt or registry edit.
+    const fs::path self = steamfix::app::current_executable();
+    std::wstring command;
+    for (const auto& argument : std::array{self.native(), std::wstring{L"--steamfix-elevated-launch"},
+                                         std::to_wstring(GetCurrentProcessId()), steam.native(),
+                                         launcher.native(), std::wstring{L"--fixture-launcher"}}) {
+        steamfix::command_line::append_quoted(command, argument);
+    }
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION information{};
+    require(CreateProcessW(self.c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr,
+                           steam.parent_path().c_str(), &startup, &information) != FALSE,
+            "create authenticated entry fixture");
+    const steamfix::UniqueHandle child(information.hProcess);
+    const steamfix::UniqueHandle thread(information.hThread);
+    if (WaitForSingleObject(child.get(), 45000) != WAIT_OBJECT_0) {
+        // This is the child just created above, never a discovered process.
+        TerminateProcess(child.get(), 99);
+        WaitForSingleObject(child.get(), 5000);
+        throw std::runtime_error("authenticated entry fixture did not finish");
+    }
+    DWORD status{};
+    require(GetExitCodeProcess(child.get(), &status) != FALSE, "read entry fixture status");
+    return steamfix::windows_exit_status(status);
 }
 
 void check_session(const fs::path& directory) {
@@ -249,6 +280,21 @@ void check_session(const fs::path& directory) {
     const fs::path recovery = acl::recovery_path(game);
     const std::vector<std::wstring> arguments{launcher.native(), L"--fixture-launcher"};
     require(app::run(log, arguments, recovery, steam) == 7, "launcher status survives protected session");
+    if (elevation::is_elevated()) {
+        const int status = authenticated_entry(steam, launcher);
+        if (status != 7) {
+            throw std::runtime_error("authenticated application entry failed with status " +
+                                     std::to_string(status) + ": " + read_file(game / L"steamfix.log"));
+        }
+        const fs::path linked_log = game / L"linked.log";
+        require(CreateHardLinkW(linked_log.c_str(), (game / L"steamfix.log").c_str(), nullptr) != FALSE,
+                "create entry log-failure fixture");
+        require(authenticated_entry(steam, launcher) == static_cast<int>(ExitCode::log_initialization),
+                "entry retains log initialization error code");
+        fs::remove(linked_log);
+    } else {
+        std::cout << "SKIP: authenticated elevated entry requires an already elevated test token.\n";
+    }
     require(!fs::exists(recovery) && read_file(renderer) == "immutable renderer contents" &&
             read_file(renderer32) == "immutable 32-bit contents", "session restores and cleans journal");
     // A valid path with invalid executable bytes forces CreateProcess failure
@@ -279,6 +325,9 @@ void error(std::wstring_view) noexcept {}
 int main() {
     try {
         const auto arguments = steamfix::app::command_line_arguments();
+        if (!arguments.empty() && arguments.front() == L"--steamfix-elevated-launch") {
+            return steamfix::app::entry();
+        }
         if (arguments == std::vector<std::wstring>{L"--fixture-game"}) {
             Sleep(2000);
             return 0;
