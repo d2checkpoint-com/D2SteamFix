@@ -1,0 +1,18 @@
+#pragma once
+
+#include <filesystem>
+
+namespace steamfix {
+class Logger;
+}
+
+namespace steamfix::repair {
+
+// Inspect the denial left by this program before accepting permissions as a new baseline.
+bool needed(const std::filesystem::path& steam_directory, const Logger& log);
+
+// Cancellation leaves applications, renderer files, and recovery state untouched.
+bool run(const std::filesystem::path& game_directory,
+         const std::filesystem::path& recovery_path, const Logger& log);
+
+} // namespace steamfix::repair

@@ -24,6 +24,7 @@ add_executable(steamfix WIN32
     src/overlay.cpp
     src/paths.cpp
     src/process.cpp
+    src/repair.cpp
     src/steam.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/steamfix.rc"
     src/steamfix.manifest
@@ -48,7 +49,7 @@ target_link_options(steamfix PRIVATE
     $<$<CONFIG:Release>:/Brepro>
     $<$<CONFIG:Release>:/PDBALTPATH:steamfix.pdb>
 )
-target_link_libraries(steamfix PRIVATE advapi32 crypt32 ole32 shell32 user32)
+target_link_libraries(steamfix PRIVATE advapi32 comctl32 comdlg32 crypt32 ole32 shell32 user32)
 set_target_properties(steamfix PROPERTIES INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
 
 install(TARGETS steamfix RUNTIME DESTINATION .)
